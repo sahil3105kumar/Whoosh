@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual Environment
+.venv/
+
+# uv
+.python-version
+
+# Coverage
+.coverage
+htmlcov/
+
+# pytest
+.pytest_cache/
+
+# Ruff
+.ruff_cache/
+
+# mypy
+.mypy_cache/
+
+# VS Code
+.vscode/
+
+# JetBrains
+.idea/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Node
+node_modules/
+
+# Vite
+apps/web/dist/
+
+# Environment
+.env
+.env.*
+
+# Temporary
+tmp/
+temp/
+
+# Docker
+*.pid
