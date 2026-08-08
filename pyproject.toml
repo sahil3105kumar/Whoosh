@@ -1,7 +1,7 @@
 [project]
 name = "whoosh"
 version = "0.1.0"
-description = "Add your description here"
+description = "A p2p chat and file sharing application."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []

@@ -14,7 +14,7 @@ class StrEnum(str, Enum):
     """Base class for string-valued enums."""
 
     def __str__(self) -> str:
-        return self.value
+        return str(self.value)
 
 
 class MessageType(StrEnum):
