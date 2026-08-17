@@ -23,3 +23,11 @@ class RoomExpiredError(SignalingError):
     def __init__(self, room_id: str) -> None:
         self.room_id = room_id
         super().__init__(f"Room expired: {room_id!r}")
+
+
+class RoomFullError(SignalingError):
+    """Raised when a peer attempts to join a room that already has 2 peers."""
+
+    def __init__(self, room_id: str) -> None:
+        self.room_id = room_id
+        super().__init__(f"Room is full: {room_id!r}")
