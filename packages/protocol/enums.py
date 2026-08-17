@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 
 
-class StrEnum(str, Enum):
+class StrEnum(str, Enum):  # noqa: UP042
     """Base class for string-valued enums."""
 
     def __str__(self) -> str:
