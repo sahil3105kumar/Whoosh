@@ -61,11 +61,7 @@ class ConnectionManager:
         self._connections[room_id][peer_id] = websocket
 
         # Notify other connected peers
-        await self._broadcast(
-            room_id,
-            sender_id=peer_id,
-            message={"type": "peer_joined", "peer_id": peer_id},
-        )
+        await self.relay(room_id, peer_id, {"type": "peer_joined", "peer_id": peer_id})
 
         return peer_id
 
@@ -82,38 +78,18 @@ class ConnectionManager:
         room_peers.pop(peer_id, None)
 
         # Notify remaining connected peers
-        await self._broadcast(
-            room_id,
-            sender_id=peer_id,
-            message={"type": "peer_disconnected", "peer_id": peer_id},
-        )
+        await self.relay(room_id, peer_id, {"type": "peer_disconnected", "peer_id": peer_id})
 
         # Clean up the dict entry if no active connections remain
         if not room_peers:
             del self._connections[room_id]
 
-    async def relay(
-        self,
-        room_id: str,
-        sender_id: str,
-        message: dict,
-    ) -> None:
-        """Forward a message to all other connected peers in the room."""
-        await self._broadcast(room_id, sender_id=sender_id, message=message)
+    async def relay(self, room_id: str, sender_id: str, message: dict) -> None:
+        """Send a JSON message to every connected peer in the room except the sender."""
+        for pid, ws in self._connections.get(room_id, {}).items():
+            if pid != sender_id:
+                await ws.send_json(message)
 
     def is_connected(self, room_id: str, peer_id: str) -> bool:
         """Check if a peer currently has an active WebSocket."""
         return peer_id in self._connections.get(room_id, {})
-
-    async def _broadcast(
-        self,
-        room_id: str,
-        *,
-        sender_id: str,
-        message: dict,
-    ) -> None:
-        """Send a JSON message to every connected peer except the sender."""
-        room_peers = self._connections.get(room_id, {})
-        for pid, ws in room_peers.items():
-            if pid != sender_id:
-                await ws.send_json(message)

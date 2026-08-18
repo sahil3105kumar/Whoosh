@@ -18,9 +18,7 @@ from packages.signaling.room_manager import RoomManager
 
 def _make_ws() -> AsyncMock:
     """Create a mock WebSocket."""
-    ws = AsyncMock()
-    ws.send_json = AsyncMock()
-    return ws
+    return AsyncMock()
 
 
 @pytest.fixture
