@@ -9,14 +9,7 @@ crosses the DataChannel and the RTC layer doesn't know it exists.
 
 from __future__ import annotations
 
-from enum import Enum
-
-
-class StrEnum(str, Enum):
-    """Base class for string-valued enums (mirrors packages/protocol/enums.py)."""
-
-    def __str__(self) -> str:
-        return str(self.value)
+from enum import StrEnum
 
 
 class RoomState(StrEnum):
