@@ -4,7 +4,7 @@ import secrets
 import time
 
 from .enums import RoomState
-from .exceptions import RoomExpiredError, RoomNotFoundError
+from .exceptions import RoomExpiredError, RoomFullError, RoomNotFoundError
 from .models import Room
 
 #: How long a room lives before it's considered expired if nobody's acted on it.
@@ -18,6 +18,9 @@ DEFAULT_ROOM_TTL_SECONDS: int = 10 * 60
 #: If rooms ever hold sensitive data before v4.0's password-protected rooms lands, this
 #: is the first thing to revisit.
 _ROOM_ID_BYTES = 4
+
+#: Maximum number of peers allowed in a room (v1 is strictly 1-to-1).
+_MAX_PEERS = 2
 
 
 def _generate_room_id() -> str:
@@ -68,6 +71,47 @@ class RoomManager:
             raise RoomExpiredError(room_id)
 
         return room
+
+    def join_room(self, room_id: str, peer_id: str) -> Room:
+        """Add a peer to a room.
+
+        Transitions room state: CREATED -> WAITING (1 peer),
+        WAITING -> CONNECTED (2 peers). Raises RoomFullError if
+        the room already has the maximum number of peers.
+        """
+        room = self.get_room(room_id)
+
+        if len(room.peer_ids) >= _MAX_PEERS:
+            raise RoomFullError(room_id)
+
+        room.peer_ids.add(peer_id)
+
+        if len(room.peer_ids) == 1:
+            room.state = RoomState.WAITING
+        elif len(room.peer_ids) == 2:
+            room.state = RoomState.CONNECTED
+
+        return room
+
+    def leave_room(self, room_id: str, peer_id: str) -> None:
+        """Remove a peer from a room.
+
+        The room stays open when one peer leaves — only when all peers
+        have left (room is empty) does it get expired and evicted.
+        State transitions back to WAITING if one peer remains.
+        """
+        try:
+            room = self.get_room(room_id)
+        except (RoomNotFoundError, RoomExpiredError):
+            return  # Already gone, nothing to do
+
+        room.peer_ids.discard(peer_id)
+
+        if len(room.peer_ids) == 0:
+            room.state = RoomState.EXPIRED
+            del self._rooms[room_id]
+        elif len(room.peer_ids) == 1:
+            room.state = RoomState.WAITING
 
     def room_count(self) -> int:
         """Number of rooms currently tracked (including any not yet
