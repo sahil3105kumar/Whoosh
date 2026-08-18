@@ -14,9 +14,6 @@ from enum import StrEnum
 
 class RoomState(StrEnum):
     """Lifecycle of a signaling room.
-
-
-
     CREATED is the instant a room exists but no peer has connected to
     it via WebSocket yet. The transition to WAITING happens when the creating peer's WebSocket
     connects.

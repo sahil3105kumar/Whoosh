@@ -15,11 +15,9 @@ class RoomNotFoundError(SignalingError):
 
 class RoomExpiredError(SignalingError):
     """Raised when a room_id existed but has since expired.
-
     Kept distinct from RoomNotFoundError so callers (and API
     responses) can tell "never existed" apart from "existed, timed
-    out" — useful for a client that shows "this room has expired"
-    instead of a generic 404.
+    out"
     """
 
     def __init__(self, room_id: str) -> None:

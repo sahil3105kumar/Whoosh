@@ -7,17 +7,15 @@ from .enums import RoomState
 from .exceptions import RoomExpiredError, RoomNotFoundError
 from .models import Room
 
-#: How long a room lives before it's considered expired if nobody's
-#: acted on it. Chosen to comfortably cover "create a room, share the
-#: code, other person joins" without leaving stale rooms around for
-#: long — tune once real usage data exists.
+#: How long a room lives before it's considered expired if nobody's acted on it.
+#: Chosen to comfortably cover "create a room, share the code, other person joins"
+#: without leaving stale rooms around for long — tune once real usage data exists.
 DEFAULT_ROOM_TTL_SECONDS: int = 10 * 60
 
-#: Room IDs are meant to be typed or read aloud/shared quickly, not
-#: cryptographically unguessable — that's why they're short rather
-#: than full UUIDs. 4 bytes (8 hex chars) is ~4 billion possibilities,
-#: reasonable for a short-lived, low-value target. If rooms ever hold
-#: sensitive data before v4.0's password-protected rooms lands, this
+#: Room IDs are meant to be typed or read aloud/shared quickly, not cryptographically
+#: unguessable — that's why they're short rather than full UUIDs. 4 bytes (8 hex
+#: chars) is ~4 billion possibilities, reasonable for a short-lived, low-value target.
+#: If rooms ever hold sensitive data before v4.0's password-protected rooms lands, this
 #: is the first thing to revisit.
 _ROOM_ID_BYTES = 4
 

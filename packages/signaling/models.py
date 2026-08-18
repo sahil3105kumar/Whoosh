@@ -2,8 +2,7 @@
 The Room domain entity.
 
 A Room is pure data — it holds no logic of its own. RoomManager owns
-all state transitions (see room_manager.py); Room just describes
-what a room *is* at a point in time.
+all state transitions.
 """
 
 from __future__ import annotations
