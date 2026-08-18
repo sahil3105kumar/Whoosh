@@ -110,20 +110,18 @@ class PeerLeavePayload(Payload):
 # ---------------------------------------------------------------------------
 
 AnyPayload = Annotated[
-    (
-        HelloPayload
-        | ChatPayload
-        | FileMetadataPayload
-        | FileChunkPayload
-        | ProgressPayload
-        | TransferCompletePayload
-        | TransferCancelPayload
-        | ErrorPayload
-        | PingPayload
-        | PongPayload
-        | PeerJoinPayload
-        | PeerLeavePayload
-    ),
+    HelloPayload
+    | ChatPayload
+    | FileMetadataPayload
+    | FileChunkPayload
+    | ProgressPayload
+    | TransferCompletePayload
+    | TransferCancelPayload
+    | ErrorPayload
+    | PingPayload
+    | PongPayload
+    | PeerJoinPayload
+    | PeerLeavePayload,
     Field(discriminator=None),
 ]
 

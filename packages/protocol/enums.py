@@ -7,7 +7,14 @@ signaling server.
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum
+
+
+class StrEnum(str, Enum):  # noqa: UP042
+    """Base class for string-valued enums."""
+
+    def __str__(self) -> str:
+        return str(self.value)
 
 
 class MessageType(StrEnum):
