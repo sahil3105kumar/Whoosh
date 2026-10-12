@@ -1,173 +1,262 @@
 """
-Whoosh CLI — create or join a room and establish a P2P DataChannel.
+Whoosh CLI — chat and send files peer-to-peer.
 
 Usage:
-    python -m apps.cli.main create [--server URL]
-    python -m apps.cli.main join ROOM_ID [--server URL]
+    whoosh create [--out DIR]           create a room, then chat (/send to send files)
+    whoosh join ROOM_ID [--out DIR]     join a room, then chat
+    whoosh send FILE [FILE ...]         create a room, send files, exit
+    whoosh receive ROOM_ID [--out DIR]  join a room, save incoming files, exit
+
+    Global: --server URL (default $WHOOSH_SERVER, else http://localhost:8000),
+            -v for debug logs.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import json
+import contextlib
 import logging
+import os
+import shlex
 import sys
-import urllib.request
-from typing import Any
+import threading
+from pathlib import Path
 
-import websockets
-from aiortc import RTCConfiguration, RTCIceServer
+from apps.cli.connection import ConnectError, Connection, connect, create_room
+from apps.cli.session import Session, Ui
+from packages.protocol.enums import Capability
+from packages.transfer.manager import TransferStatus
 
-from packages.rtc.peer import WebRTCPeer
-
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-# aioice logs every ICE candidate-pair check at INFO — dozens of lines per connect
-logging.getLogger("aioice").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
-#: Seconds allowed from the start of negotiation to an open DataChannel.
-#: Covers STUN candidate gathering plus ICE connectivity checks.
-CONNECT_TIMEOUT = 30.0
+HELP = """\
+Type a message and press Enter to chat. Commands:
+  /send PATH [PATH ...]   send files (quote paths with spaces)
+  /cancel                 cancel all active transfers
+  /ping                   measure round-trip time
+  /quit                   leave"""
+
+#: How long to wait for the peer's hello before sending files.
+_HELLO_TIMEOUT = 10.0
 
 
-# ── HTTP helper (stdlib only, no requests/httpx needed) ──────────────
+# ── stdin ───────────────────────────────────────────────────────────
 
 
-def _create_room(server: str) -> str:
-    req = urllib.request.Request(f"{server}/rooms", method="POST")
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())["room_id"]
+def _stdin_lines() -> asyncio.Queue[str | None]:
+    """Lines from stdin, fed by a daemon thread (portable, unlike
+    connect_read_pipe, and won't block interpreter exit). None = EOF."""
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def reader() -> None:
+        for line in sys.stdin:
+            loop.call_soon_threadsafe(queue.put_nowait, line.rstrip("\n"))
+        loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    return queue
 
 
-def _fetch_rtc_config(server: str) -> RTCConfiguration:
-    with urllib.request.urlopen(f"{server}/config") as resp:
-        ice_servers = json.loads(resp.read())["ice_servers"]
-    return RTCConfiguration(iceServers=[RTCIceServer(urls=s["urls"]) for s in ice_servers])
+# ── Modes ───────────────────────────────────────────────────────────
 
 
-# ── Main loop ────────────────────────────────────────────────────────
+async def _interactive(conn: Connection, session: Session, ui: Ui) -> None:
+    ui.line("✓ Connected peer-to-peer. Type /help for commands.")
+    inbound = asyncio.create_task(session.run_inbound())
+    commands = asyncio.create_task(_command_loop(session, ui))
+    tasks: set[asyncio.Task[None]] = {inbound, commands, conn.signaling}
+
+    try:
+        while True:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()  # re-raise failures
+            if inbound in done:
+                ui.line("Peer disconnected.")
+                return
+            if commands in done:
+                return
+            # Only signaling finished: the server went away, P2P is unaffected
+            tasks.discard(conn.signaling)
+    finally:
+        for transfer in session.transfers.transfers:
+            session.transfers.cancel(transfer.id, "peer left")
+        for task in (inbound, commands):
+            task.cancel()
 
 
-async def _run(server: str, room_id: str, is_creator: bool) -> None:
-    ws_url = f"{server.replace('http', 'ws')}/rooms/{room_id}/ws"
-    rtc_config = _fetch_rtc_config(server)
+async def _command_loop(session: Session, ui: Ui) -> None:
+    lines = _stdin_lines()
+    sends: set[asyncio.Task[None]] = set()
 
-    async with websockets.connect(ws_url) as ws:
-        peer = WebRTCPeer(
-            on_signaling_message=lambda msg: ws.send(json.dumps(msg)),
-            on_message=lambda data: _on_data(data),
-            config=rtc_config,
-        )
-        # Resolved once the other peer shows up (creator: peer_joined,
-        # joiner: offer). Until then we wait indefinitely.
-        negotiation_started: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    while (line := await lines.get()) is not None:
+        line = line.strip()
+        if not line:
+            continue
+        if not line.startswith("/"):
+            session.send_chat(line)
+            continue
 
-        async def _listen_signaling() -> None:
-            try:
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    t = msg.get("type")
+        cmd, _, arg = line.partition(" ")
+        if cmd == "/quit":
+            return
+        elif cmd == "/help":
+            ui.line(HELP)
+        elif cmd == "/ping":
+            session.ping()
+        elif cmd == "/cancel":
+            cancelled = [t for t in session.transfers.transfers if session.transfers.cancel(t.id)]
+            if not cancelled:
+                ui.line("No active transfers.")
+        elif cmd == "/send":
+            if not session.peer_can(Capability.FILE_TRANSFER):
+                ui.line("Peer doesn't support file transfer.")
+                continue
+            for path in _parse_paths(arg, ui):
+                task = asyncio.create_task(_send_one(session, path, ui))
+                sends.add(task)
+                task.add_done_callback(sends.discard)
+        else:
+            ui.line(f"Unknown command {cmd}. Type /help.")
 
-                    if t in ("peer_joined", "offer") and not negotiation_started.done():
-                        negotiation_started.set_result(None)
 
-                    if t == "hello":
-                        log.info("Connected (peer_id=%s)", msg["peer_id"])
+def _parse_paths(arg: str, ui: Ui) -> list[Path]:
+    try:
+        raw = shlex.split(arg)
+    except ValueError as exc:
+        ui.line(f"Can't parse paths: {exc}")
+        return []
+    if not raw:
+        ui.line("Usage: /send PATH [PATH ...]")
+    paths = []
+    for item in raw:
+        path = Path(item).expanduser()
+        if path.is_file():
+            paths.append(path)
+        else:
+            ui.line(f"Not a file: {path}")
+    return paths
 
-                    elif t == "peer_joined":
-                        if is_creator:
-                            log.info("Peer joined — initiating WebRTC...")
-                            await peer.create_offer()
 
-                    elif t in ("offer", "answer"):
-                        await peer.handle_signaling(msg)
+async def _send_one(session: Session, path: Path, ui: Ui) -> None:
+    try:
+        await session.transfers.send_file(path)
+    except OSError as exc:
+        ui.line(f"✗ {path}: {exc}")
 
-                    elif t == "peer_disconnected":
-                        log.warning("Peer dropped from signaling.")
 
-                    elif t == "peer_left":
-                        log.warning("Peer left the room.")
-
-                    elif t == "error":
-                        log.error("Signaling server: %s", msg.get("reason"))
-            except websockets.exceptions.ConnectionClosed:
-                pass
-
-        listen_task = asyncio.create_task(_listen_signaling())
-
+async def _send_files(session: Session, paths: list[Path], ui: Ui) -> bool:
+    inbound = asyncio.create_task(session.run_inbound())
+    try:
         try:
-            if not await _wait_or_fail(negotiation_started, listen_task):
-                log.error("Signaling closed before a peer arrived.")
-                sys.exit(1)
+            await asyncio.wait_for(asyncio.shield(session.peer_hello), _HELLO_TIMEOUT)
+        except TimeoutError:
+            ui.line("Peer never said hello.")
+            return False
+        if not session.peer_can(Capability.FILE_TRANSFER):
+            ui.line("Peer doesn't support file transfer.")
+            return False
 
-            if not await _wait_or_fail(peer.channel_ready, listen_task, timeout=CONNECT_TIMEOUT):
-                if peer.pc.iceConnectionState == "failed":
-                    log.error(
-                        "Direct connection failed: no network path between the peers. "
-                        "One side is likely behind a strict NAT or firewall "
-                        "(relay servers aren't supported yet)."
-                    )
-                elif listen_task.done():
-                    log.error("Signaling closed before the DataChannel opened.")
-                else:
-                    log.error("Timed out waiting for DataChannel.")
-                sys.exit(1)
-
-            print("\n✓ P2P Connection Established!")
-
-            assert peer.channel is not None
-            peer.channel.send("hello from CLI")
-            await asyncio.sleep(1)  # let the other side's message arrive
-
-            if listen_task.done():
-                listen_task.result()
-        finally:
-            listen_task.cancel()
-            await peer.close()
+        ok = True
+        for path in paths:
+            transfer = await session.transfers.send_file(path)
+            ok &= transfer.status is TransferStatus.COMPLETED
+            if inbound.done():
+                break  # channel closed; remaining files can't go
+        return ok
+    finally:
+        inbound.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await inbound
 
 
-async def _wait_or_fail(
-    fut: asyncio.Future[Any],
-    listen_task: asyncio.Task[None],
-    timeout: float | None = None,
-) -> bool:
-    """Wait for ``fut``, racing it against the signaling listener so a
-    listener failure is re-raised immediately rather than surfacing as a
-    timeout. Returns whether ``fut`` completed."""
-    waiters: set[asyncio.Future[Any]] = {fut, listen_task}
-    await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-    if listen_task.done():
-        listen_task.result()  # re-raise the listener's exception, if any
-    return fut.done()
+async def _receive_files(session: Session, ui: Ui) -> bool:
+    ui.line("✓ Connected peer-to-peer. Waiting for files...")
+    await session.run_inbound()  # until the sender closes the connection
+    transfers = session.transfers.transfers
+    if not transfers:
+        ui.line("Sender disconnected without sending anything.")
+    return bool(transfers) and all(t.status is TransferStatus.COMPLETED for t in transfers)
 
 
-async def _on_data(data: str | bytes) -> None:
-    print(f"[peer] {data}")
+# ── Entrypoint ──────────────────────────────────────────────────────
 
 
-# ── Entrypoint ───────────────────────────────────────────────────────
+async def _run(args: argparse.Namespace) -> bool:
+    ui = Ui()
+    is_creator = args.cmd in ("create", "send")
+
+    if is_creator:
+        room_id = create_room(args.server)
+        ui.line(f"Room created: {room_id}")
+        joiner = "join" if args.cmd == "create" else "receive"
+        ui.line(f"On the other machine run:  whoosh {joiner} {room_id}")
+        ui.line("Waiting for peer...")
+    else:
+        room_id = args.room_id
+        ui.line(f"Joining room {room_id}...")
+
+    async with connect(args.server, room_id, is_creator=is_creator) as conn:
+        out = Path(getattr(args, "out", ".")).expanduser()
+        session = Session(conn.peer, out, ui)
+        session.start()
+
+        if args.cmd in ("create", "join"):
+            await _interactive(conn, session, ui)
+            return True
+        if args.cmd == "send":
+            return await _send_files(session, args.files, ui)
+        return await _receive_files(session, ui)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Whoosh CLI")
-    p.add_argument("--server", default="http://localhost:8000", help="Signaling server URL")
+    p = argparse.ArgumentParser(prog="whoosh", description="Peer-to-peer chat and file transfer")
+    p.add_argument(
+        "--server",
+        default=os.environ.get("WHOOSH_SERVER", "http://localhost:8000"),
+        help="Signaling server URL (default: $WHOOSH_SERVER or http://localhost:8000)",
+    )
+    p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("create", help="Create a room and wait for a peer")
-    j = sub.add_parser("join", help="Join an existing room")
+
+    out_help = "Directory for received files (default: current directory)"
+    c = sub.add_parser("create", help="Create a room and chat")
+    c.add_argument("--out", default=".", help=out_help)
+    j = sub.add_parser("join", help="Join a room and chat")
     j.add_argument("room_id")
+    j.add_argument("--out", default=".", help=out_help)
+    s = sub.add_parser("send", help="Create a room, send files, exit")
+    s.add_argument("files", nargs="+", type=Path)
+    r = sub.add_parser("receive", help="Join a room, save incoming files, exit")
+    r.add_argument("room_id")
+    r.add_argument("--out", default=".", help=out_help)
 
     args = p.parse_args()
 
-    if args.cmd == "create":
-        room_id = _create_room(args.server)
-        print(f"Room created: {room_id}")
-        print("Waiting for peer to join...")
-        asyncio.run(_run(args.server, room_id, is_creator=True))
+    level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING, format="%(message)s"
+    )
+    # Our own loggers at INFO so "Peer joined — connecting..." shows; libraries stay quiet
+    logging.getLogger("apps").setLevel(level)
+    # aioice logs every ICE candidate-pair check at INFO — dozens of lines per connect
+    logging.getLogger("aioice").setLevel(logging.WARNING)
 
-    elif args.cmd == "join":
-        print(f"Joining room {args.room_id}...")
-        asyncio.run(_run(args.server, args.room_id, is_creator=False))
+    if args.cmd == "send":
+        missing = [f for f in args.files if not f.is_file()]
+        if missing:
+            p.error(f"not a file: {', '.join(map(str, missing))}")
+
+    try:
+        ok = asyncio.run(_run(args))
+    except ConnectError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

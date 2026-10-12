@@ -2,7 +2,8 @@
 Minimal WebRTC peer wrapper around aiortc.
 
 Handles SDP offer/answer exchange and DataChannel lifecycle.
-The caller wires signaling transport (WebSocket, etc.) via callbacks.
+The caller wires signaling transport (WebSocket, etc.) via a callback
+and reads incoming DataChannel messages, in order, with ``recv()``.
 """
 
 from __future__ import annotations
@@ -10,12 +11,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from typing import Any
 
 from aiortc import RTCConfiguration, RTCDataChannel, RTCPeerConnection, RTCSessionDescription
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -23,21 +21,28 @@ logger = logging.getLogger(__name__)
 # For NAT traversal, pass a config with real STUN/TURN servers.
 _DEFAULT_CONFIG = RTCConfiguration(iceServers=[])
 
+#: drain() blocks while more than this many bytes are queued for sending...
+HIGH_WATER_BYTES = 1024 * 1024
+#: ...and resumes once the queue falls to this level.
+LOW_WATER_BYTES = 256 * 1024
+
 
 class WebRTCPeer:
     """Wraps an RTCPeerConnection to establish a single DataChannel."""
 
     def __init__(
         self,
-        on_signaling_message: Callable[[dict], Awaitable[None]],
-        on_message: Callable[[str | bytes], Awaitable[None]] | None = None,
+        on_signaling_message: Callable[[dict[str, Any]], Awaitable[None]],
         config: RTCConfiguration | None = None,
     ) -> None:
         self.pc = RTCPeerConnection(configuration=config or _DEFAULT_CONFIG)
         self.channel: RTCDataChannel | None = None
         self._on_sig = on_signaling_message
-        self._on_msg = on_message
-        self.channel_ready: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+        loop = asyncio.get_running_loop()
+        self.channel_ready: asyncio.Future[bool] = loop.create_future()
+        # Incoming messages in arrival order; None marks channel close.
+        self._inbox: asyncio.Queue[str | bytes | None] = asyncio.Queue()
+        self._buffer_low = asyncio.Event()
 
         @self.pc.on("datachannel")
         def on_datachannel(ch: RTCDataChannel) -> None:
@@ -57,7 +62,7 @@ class WebRTCPeer:
             {"type": self.pc.localDescription.type, "sdp": self.pc.localDescription.sdp}
         )
 
-    async def handle_signaling(self, msg: dict) -> None:
+    async def handle_signaling(self, msg: dict[str, Any]) -> None:
         """Process an incoming SDP offer or answer from the remote peer."""
         msg_type = msg.get("type")
         if msg_type not in ("offer", "answer"):
@@ -73,23 +78,66 @@ class WebRTCPeer:
                 {"type": self.pc.localDescription.type, "sdp": self.pc.localDescription.sdp}
             )
 
+    async def recv(self) -> str | bytes | None:
+        """Next DataChannel message (str for text frames, bytes for binary),
+        or None once the channel has closed.
+
+        A queue rather than a callback so the application processes
+        messages strictly in order, and its exceptions land in its own
+        task instead of in a fire-and-forget future.
+        """
+        return await self._inbox.get()
+
+    def send(self, data: str | bytes) -> None:
+        """Send one message. Raises ConnectionError if the channel isn't open."""
+        if self.channel is None or self.channel.readyState != "open":
+            raise ConnectionError("DataChannel is not open")
+        self.channel.send(data)
+
+    async def drain(self) -> None:
+        """Wait until the send buffer is below HIGH_WATER_BYTES.
+
+        Bulk senders call this before each send so a large file streams
+        at network speed instead of being queued into memory whole.
+        """
+        while True:
+            if self.channel is None or self.channel.readyState != "open":
+                raise ConnectionError("DataChannel is not open")
+            if self.channel.bufferedAmount <= HIGH_WATER_BYTES:
+                return
+            # No await between the check and clear(), so the low-water
+            # event can't fire in between and be lost.
+            self._buffer_low.clear()
+            await self._buffer_low.wait()
+
     def _wire_channel(self) -> None:
-        if self.channel is None:
+        channel = self.channel
+        if channel is None:
             return
 
+        channel.bufferedAmountLowThreshold = LOW_WATER_BYTES
+
         # Channel may already be open (race between event and handler setup)
-        if self.channel.readyState == "open" and not self.channel_ready.done():
+        if channel.readyState == "open" and not self.channel_ready.done():
             self.channel_ready.set_result(True)
 
-        @self.channel.on("open")
+        @channel.on("open")
         def on_open() -> None:
             if not self.channel_ready.done():
                 self.channel_ready.set_result(True)
 
-        @self.channel.on("message")
+        @channel.on("message")
         def on_message(data: str | bytes) -> None:
-            if self._on_msg:
-                asyncio.ensure_future(self._on_msg(data))
+            self._inbox.put_nowait(data)
+
+        @channel.on("bufferedamountlow")
+        def on_buffered_amount_low() -> None:
+            self._buffer_low.set()
+
+        @channel.on("close")
+        def on_close() -> None:
+            self._inbox.put_nowait(None)
+            self._buffer_low.set()  # wake drain() so it sees the closed state
 
     async def close(self) -> None:
         await self.pc.close()
