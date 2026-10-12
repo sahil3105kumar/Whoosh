@@ -145,3 +145,21 @@ async def test_reconnect_with_peer_id():
         async with aconnect_ws(f"/rooms/{room_id}/ws?peer_id={peer_id}", client) as ws:
             hello2 = await ws.receive_json()
             assert hello2["peer_id"] == peer_id
+
+
+async def test_invalid_json_frees_socket_registration():
+    from httpx_ws import WebSocketDisconnect
+
+    from apps.server.main import connection_manager
+
+    room_id = await _create_room()
+
+    async with _http_client() as client:
+        async with aconnect_ws(f"/rooms/{room_id}/ws", client) as ws:
+            hello = await ws.receive_json()
+            await ws.send_text("not json")
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                await ws.receive_json()
+            assert exc_info.value.code == 1007
+
+    assert not connection_manager.is_connected(room_id, hello["peer_id"])

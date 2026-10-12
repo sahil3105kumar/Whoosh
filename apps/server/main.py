@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
+import logging
 import time
+from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
@@ -13,7 +18,10 @@ from packages.signaling.exceptions import (
 )
 from packages.signaling.room_manager import RoomManager
 
-app = FastAPI(title="Whoosh Signaling Server")
+logger = logging.getLogger(__name__)
+
+#: How often the background sweep evicts expired rooms.
+_SWEEP_INTERVAL_SECONDS = 60.0
 
 # Single process-wide instance. Fine for v1.0 (single-instance
 # deployment); revisit if
@@ -21,6 +29,29 @@ app = FastAPI(title="Whoosh Signaling Server")
 # in room_manager.py.
 room_manager = RoomManager()
 connection_manager = ConnectionManager(room_manager)
+
+
+async def _sweep_expired_rooms() -> None:
+    while True:
+        await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)
+        evicted = room_manager.evict_expired()
+        if evicted:
+            logger.info("evicted %d expired room(s)", evicted)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    sweeper = asyncio.create_task(_sweep_expired_rooms())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sweeper
+        await connection_manager.shutdown()
+
+
+app = FastAPI(title="Whoosh Signaling Server", lifespan=lifespan)
 
 
 class CreateRoomResponse(BaseModel):
@@ -107,12 +138,18 @@ async def ws_signaling(
         }
     )
 
+    # Always unregister, whatever ends the loop — otherwise a bad
+    # frame leaves a dead socket registered and the slot held.
     try:
         while True:
             data = await websocket.receive_json()
             await connection_manager.relay(room_id, assigned_peer_id, data)
     except WebSocketDisconnect:
-        await connection_manager.disconnect(room_id, assigned_peer_id)
+        pass
+    except json.JSONDecodeError:
+        await websocket.close(code=1007, reason="invalid JSON")
+    finally:
+        await connection_manager.disconnect(room_id, assigned_peer_id, websocket)
 
 
 @app.get("/healthz")

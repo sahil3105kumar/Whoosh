@@ -163,3 +163,17 @@ def test_leave_unknown_peer_is_noop():
     # Room unchanged
     assert room.state == RoomState.WAITING
     assert room.peer_ids == {"peer1"}
+
+
+def test_evict_expired_removes_only_expired_rooms():
+    manager = RoomManager()
+    stale = manager.create_room()
+    fresh = manager.create_room()
+    stale.expires_at = stale.created_at - 1
+
+    assert manager.evict_expired() == 1
+
+    assert stale.state == RoomState.EXPIRED
+    assert manager.get_room(fresh.id) is fresh
+    with pytest.raises(RoomNotFoundError):
+        manager.get_room(stale.id)
