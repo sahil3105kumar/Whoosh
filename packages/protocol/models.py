@@ -136,4 +136,6 @@ class ProtocolMessage(BaseModel):
 
 def make_message(msg_type: MessageType, payload: Payload) -> ProtocolMessage:
     """Build a ``ProtocolMessage`` with auto-generated id and current version."""
-    return ProtocolMessage(type=msg_type, payload=payload)
+    # model_validate rather than the constructor: callers hold a ``Payload``,
+    # and validation checks it's one of the AnyPayload members.
+    return ProtocolMessage.model_validate({"type": msg_type, "payload": payload})

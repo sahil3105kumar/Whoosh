@@ -87,6 +87,8 @@ def decode(data: bytes) -> ProtocolMessage:
 
     # 3. Resolve message type
     raw_type = raw.get("type")
+    if not isinstance(raw_type, str):
+        raise UnknownMessageTypeError("<missing>" if raw_type is None else repr(raw_type))
     try:
         msg_type = MessageType(raw_type)
     except ValueError as err:
