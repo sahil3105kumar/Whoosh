@@ -93,6 +93,27 @@ whoosh/
 └── scripts/
 ```
 
+## Quick start
+
+Install the CLI:
+
+```bash
+uv tool install "whoosh[cli] @ git+https://github.com/sahil3105kumar/Whoosh"
+```
+
+Send a file:
+
+```bash
+export WHOOSH_SERVER=https://your.whoosh.server
+whoosh send report.pdf            # prints a room code
+whoosh receive <room code>        # on the other machine
+```
+
+Or chat: `whoosh create` / `whoosh join <room code>`, then `/send PATH`.
+
+Run a server locally with `uv run uvicorn apps.server.main:app`, or
+deploy one with Docker; see [docs/deployment.md](docs/deployment.md).
+
 ## Documentation
 
 * Vision
@@ -101,6 +122,7 @@ whoosh/
 * Protocol
 * Roadmap
 * [Decisions](docs/decisions.md)
+* [Deployment](docs/deployment.md)
 
 ## Roadmap
 

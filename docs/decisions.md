@@ -319,3 +319,70 @@ the top-level `apps` and `packages` directories. `--server` defaults to
 isolated environment, so the generic top-level names can't clash.
 **Revisit** — Before publishing to PyPI: move under a `whoosh`
 namespace package and make the public server the default.
+*Update: the CLI now installs as `whoosh[cli]`; see D31.*
+
+---
+
+## Deployment
+
+### D30. Uvicorn trusts forwarded headers from any source; the app port is never published
+*2026-10-12*
+
+**Decision** — The container runs uvicorn with `--proxy-headers
+--forwarded-allow-ips '*'`. In `docker/compose.yaml` the app port is
+only `expose`d on the internal network, never mapped to the host.
+**Why** — Per-IP rate limiting (D7) needs the real client IP. Caddy
+replaces any client-supplied `X-Forwarded-For` with the actual remote
+address, so trusting it is safe *as long as* Caddy is the only path to
+the app. Pinning Caddy's container IP instead would break whenever the
+network is recreated.
+**Revisit** — If the app is ever exposed directly, set
+`--forwarded-allow-ips` to the proxy's address. Otherwise anyone can
+spoof their IP and bypass the rate limit. (Verified locally: through
+Caddy the app logs the client's address, not Caddy's.)
+
+### D31. Dependencies split into `cli` and `server` extras
+*2026-10-12*
+
+**Decision** — Base dependencies are just `pydantic` (the shared
+protocol models). `whoosh[cli]` adds aiortc and websockets;
+`whoosh[server]` adds fastapi, uvicorn and websockets. The dev group
+installs both. Installing the CLI without its extra prints the correct
+install command instead of a traceback.
+**Why** — The WebRTC stack (`av`, `cryptography`, `pylibsrtp`) was 125
+of the server image's 150 MB of Python packages and is never imported
+by the server. Image 270 MB → 135 MB, with a smaller attack surface.
+**Gotcha** — uvicorn answers WebSocket upgrades with **404** unless a
+WebSocket library is installed. When websockets left the base
+dependencies, signaling broke in the image while every in-process test
+still passed. Caught by D33's smoke test; `server` now lists websockets
+explicitly.
+
+### D32. Caddy as the reverse proxy
+*2026-10-12*
+
+**Decision** — Caddy 2 in front of the app, configured by a
+four-line Caddyfile.
+**Why** — Automatic HTTPS (issue and renew) with no certbot cron, and
+WebSocket proxying with no extra config. HTTPS isn't optional: browsers
+only allow WebRTC on secure origins, which the web client will need.
+
+### D33. CI smoke-tests the built image over real sockets
+*2026-10-12*
+
+**Decision** — CI builds the Docker image, waits for its health check,
+and runs `scripts/smoke_test.py` against it: HTTP endpoints, two
+WebSocket peers, and a relayed message. The same script verifies a live
+deployment.
+**Why** — In-process tests use the full dev environment and an ASGI
+transport, so they can't see packaging or proxy problems (see D31's
+gotcha).
+
+### D34. Target host: one Docker VPS, provider-agnostic
+*2026-10-12*
+
+**Decision** — `docs/deployment.md` targets any Linux VPS running
+Docker Compose. No platform-specific config (Fly.io, etc.).
+**Why** — Single process with in-memory state (D9) wants one
+long-running machine, not autoscaling. Compose plus Caddy runs the same
+way locally (as tested) and on any provider.

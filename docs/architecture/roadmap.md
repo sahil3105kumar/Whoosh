@@ -105,11 +105,14 @@ way are recorded in [docs/decisions.md](../decisions.md). Suggested order: Phase
 
 ## Phase 5 — Ship
 
-- [ ] **16. Docker.** Multi-stage: build web → `python:3.12-slim` + uv
-      serving API and static files. **Exactly one uvicorn worker** — room
-      state is in memory.
-- [ ] **17. docker-compose + Caddy.** Automatic HTTPS and WebSocket
+- [x] **16. Docker.** Multi-stage `python:3.12-slim` + uv, server-only
+      dependencies, non-root, health check. **Exactly one uvicorn
+      worker**, because room state is in memory. *Web client static files
+      join the image with Phase 4.*
+- [x] **17. docker-compose + Caddy.** Automatic HTTPS and WebSocket
       proxying (browsers require a secure context for WebRTC).
-- [ ] **18. Hosting.** One small VPS or a single Fly.io machine.
-- [ ] **19. CI.** ruff, mypy (clean up existing errors), pytest, web
-      lint/build, Docker build, and an in-process two-peer end-to-end test.
+- [ ] **18. Hosting.** One small Docker VPS; guide in
+      [docs/deployment.md](../deployment.md). *Needs a server and domain.*
+- [x] **19. CI.** ruff, mypy (now clean), pytest (includes two real
+      aiortc peers in-process), Docker build plus smoke test over real
+      sockets. *Web lint/build joins with Phase 4.*
