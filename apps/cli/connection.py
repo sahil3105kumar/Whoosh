@@ -16,6 +16,7 @@ from typing import Any
 
 import websockets
 from aiortc import RTCConfiguration, RTCIceServer
+from websockets.exceptions import ConnectionClosed
 
 from packages.rtc.peer import WebRTCPeer
 
@@ -106,7 +107,7 @@ async def connect(server: str, room_id: str, *, is_creator: bool) -> AsyncIterat
 
                     elif t == "error":
                         log.error("Signaling server: %s", msg.get("reason"))
-            except websockets.exceptions.ConnectionClosed as exc:
+            except ConnectionClosed as exc:
                 close_reason = exc.rcvd.reason if exc.rcvd else ""
 
         listen_task = asyncio.create_task(_listen_signaling())

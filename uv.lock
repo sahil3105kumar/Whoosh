@@ -1066,7 +1066,15 @@ name = "whoosh"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "pydantic" },
+]
+
+[package.optional-dependencies]
+cli = [
     { name = "aiortc" },
+    { name = "websockets" },
+]
+server = [
     { name = "fastapi" },
     { name = "uvicorn" },
     { name = "websockets" },
@@ -1081,15 +1089,19 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+    { name = "whoosh", extra = ["cli", "server"] },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "aiortc", specifier = ">=1.15.0" },
-    { name = "fastapi", specifier = ">=0.141.0" },
-    { name = "uvicorn", specifier = ">=0.30.0" },
-    { name = "websockets", specifier = ">=17.0.1" },
+    { name = "aiortc", marker = "extra == 'cli'", specifier = ">=1.15.0" },
+    { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.141.0" },
+    { name = "pydantic", specifier = ">=2.7" },
+    { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.30.0" },
+    { name = "websockets", marker = "extra == 'cli'", specifier = ">=17.0.1" },
+    { name = "websockets", marker = "extra == 'server'", specifier = ">=17.0.1" },
 ]
+provides-extras = ["cli", "server"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1100,6 +1112,7 @@ dev = [
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "ruff", specifier = ">=0.15.22" },
+    { name = "whoosh", extras = ["cli", "server"] },
 ]
 
 [[package]]

@@ -23,6 +23,8 @@ import sys
 import threading
 from pathlib import Path
 
+from websockets.exceptions import WebSocketException
+
 from apps.cli.connection import ConnectError, Connection, connect, create_room
 from apps.cli.session import Session, Ui
 from packages.protocol.enums import Capability
@@ -253,6 +255,11 @@ def main() -> None:
         ok = asyncio.run(_run(args))
     except ConnectError as exc:
         print(f"✗ {exc}", file=sys.stderr)
+        sys.exit(1)
+    # Network failures talking to the signaling server: unreachable, TLS,
+    # HTTP errors (URLError is an OSError), rejected WebSocket handshake
+    except (OSError, WebSocketException) as exc:
+        print(f"✗ Can't reach signaling server {args.server}: {exc}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
