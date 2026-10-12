@@ -219,6 +219,27 @@ async def ws_signaling(
         await connection_manager.disconnect(room_id, assigned_peer_id, websocket)
 
 
+class IceServer(BaseModel):
+    """Same shape as the browser's RTCIceServer dictionary."""
+
+    urls: list[str]
+
+
+class ClientConfigResponse(BaseModel):
+    ice_servers: list[IceServer]
+
+
+@app.get("/config")
+async def client_config() -> ClientConfigResponse:
+    """Runtime config clients fetch before connecting.
+
+    Serving ICE servers from here (rather than hardcoding them in each
+    client) means adding TURN later is a server config change only.
+    """
+    ice_servers = [IceServer(urls=list(settings.stun_urls))] if settings.stun_urls else []
+    return ClientConfigResponse(ice_servers=ice_servers)
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str | float]:
     """Liveness check for deployment (Docker healthcheck / reverse

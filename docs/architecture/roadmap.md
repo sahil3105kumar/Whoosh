@@ -73,11 +73,11 @@ Concrete work remaining to ship v1.0. Suggested order: Phase 1 → CLI chat
 
 ## Phase 2 — NAT traversal
 
-- [ ] **6. STUN.** `GET /config` returns ICE servers; both clients fetch it
+- [x] **6. STUN.** `GET /config` returns ICE servers; both clients fetch it
       instead of hardcoding `iceServers=[]`.
-- [ ] **7. TURN.** Deferred to v4.0. Without it, peers behind symmetric NAT
+- [x] **7. TURN.** Deferred to v4.0. Without it, peers behind symmetric NAT
       can't connect — clients must surface a clear "direct connection
-      failed" error.
+      failed" error. (CLI done; web client must do the same.)
 
 ## Phase 3 — Protocol & transfer
 

@@ -33,3 +33,8 @@ def test_origin_allowed():
     assert locked.origin_allowed("https://whoosh.example")
     assert locked.origin_allowed(None)  # non-browser clients send no Origin
     assert not locked.origin_allowed("https://evil.example")
+
+
+def test_stun_urls_can_be_disabled(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("WHOOSH_STUN_URLS", "")
+    assert Settings.from_env().stun_urls == ()

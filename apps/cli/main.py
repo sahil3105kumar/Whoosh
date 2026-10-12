@@ -17,6 +17,7 @@ import urllib.request
 from typing import Any
 
 import websockets
+from aiortc import RTCConfiguration, RTCIceServer
 
 from packages.rtc.peer import WebRTCPeer
 
@@ -24,6 +25,10 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 # aioice logs every ICE candidate-pair check at INFO — dozens of lines per connect
 logging.getLogger("aioice").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
+
+#: Seconds allowed from the start of negotiation to an open DataChannel.
+#: Covers STUN candidate gathering plus ICE connectivity checks.
+CONNECT_TIMEOUT = 30.0
 
 
 # ── HTTP helper (stdlib only, no requests/httpx needed) ──────────────
@@ -35,23 +40,37 @@ def _create_room(server: str) -> str:
         return json.loads(resp.read())["room_id"]
 
 
+def _fetch_rtc_config(server: str) -> RTCConfiguration:
+    with urllib.request.urlopen(f"{server}/config") as resp:
+        ice_servers = json.loads(resp.read())["ice_servers"]
+    return RTCConfiguration(iceServers=[RTCIceServer(urls=s["urls"]) for s in ice_servers])
+
+
 # ── Main loop ────────────────────────────────────────────────────────
 
 
 async def _run(server: str, room_id: str, is_creator: bool) -> None:
     ws_url = f"{server.replace('http', 'ws')}/rooms/{room_id}/ws"
+    rtc_config = _fetch_rtc_config(server)
 
     async with websockets.connect(ws_url) as ws:
         peer = WebRTCPeer(
             on_signaling_message=lambda msg: ws.send(json.dumps(msg)),
             on_message=lambda data: _on_data(data),
+            config=rtc_config,
         )
+        # Resolved once the other peer shows up (creator: peer_joined,
+        # joiner: offer). Until then we wait indefinitely.
+        negotiation_started: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
         async def _listen_signaling() -> None:
             try:
                 async for raw in ws:
                     msg = json.loads(raw)
                     t = msg.get("type")
+
+                    if t in ("peer_joined", "offer") and not negotiation_started.done():
+                        negotiation_started.set_result(None)
 
                     if t == "hello":
                         log.info("Connected (peer_id=%s)", msg["peer_id"])
@@ -69,25 +88,27 @@ async def _run(server: str, room_id: str, is_creator: bool) -> None:
 
                     elif t == "peer_left":
                         log.warning("Peer left the room.")
+
+                    elif t == "error":
+                        log.error("Signaling server: %s", msg.get("reason"))
             except websockets.exceptions.ConnectionClosed:
                 pass
 
         listen_task = asyncio.create_task(_listen_signaling())
 
         try:
-            # Race the DataChannel against the listener so a signaling
-            # failure surfaces immediately instead of as a timeout.
-            waiters: set[asyncio.Future[Any]] = {peer.channel_ready, listen_task}
-            await asyncio.wait(
-                waiters,
-                timeout=10.0,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if listen_task.done():
-                listen_task.result()  # re-raise the listener's exception, if any
+            if not await _wait_or_fail(negotiation_started, listen_task):
+                log.error("Signaling closed before a peer arrived.")
+                sys.exit(1)
 
-            if not peer.channel_ready.done():
-                if listen_task.done():
+            if not await _wait_or_fail(peer.channel_ready, listen_task, timeout=CONNECT_TIMEOUT):
+                if peer.pc.iceConnectionState == "failed":
+                    log.error(
+                        "Direct connection failed: no network path between the peers. "
+                        "One side is likely behind a strict NAT or firewall "
+                        "(relay servers aren't supported yet)."
+                    )
+                elif listen_task.done():
                     log.error("Signaling closed before the DataChannel opened.")
                 else:
                     log.error("Timed out waiting for DataChannel.")
@@ -104,6 +125,21 @@ async def _run(server: str, room_id: str, is_creator: bool) -> None:
         finally:
             listen_task.cancel()
             await peer.close()
+
+
+async def _wait_or_fail(
+    fut: asyncio.Future[Any],
+    listen_task: asyncio.Task[None],
+    timeout: float | None = None,
+) -> bool:
+    """Wait for ``fut``, racing it against the signaling listener so a
+    listener failure is re-raised immediately rather than surfacing as a
+    timeout. Returns whether ``fut`` completed."""
+    waiters: set[asyncio.Future[Any]] = {fut, listen_task}
+    await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    if listen_task.done():
+        listen_task.result()  # re-raise the listener's exception, if any
+    return fut.done()
 
 
 async def _on_data(data: str | bytes) -> None:

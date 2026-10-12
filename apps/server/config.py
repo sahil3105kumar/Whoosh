@@ -34,6 +34,9 @@ class Settings:
     #: Largest signaling message accepted, in bytes. SDP is a few KB.
     max_message_bytes: int = 64 * 1024
     log_level: str = "INFO"
+    #: STUN server URLs handed to clients via GET /config. Clients learn
+    #: their public address from these; TURN would go here too (v4.0).
+    stun_urls: tuple[str, ...] = ("stun:stun.l.google.com:19302",)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -50,6 +53,9 @@ class Settings:
             ),
             max_message_bytes=int(env.get("WHOOSH_MAX_MESSAGE_BYTES", defaults.max_message_bytes)),
             log_level=env.get("WHOOSH_LOG_LEVEL", defaults.log_level).upper(),
+            stun_urls=(
+                _csv(env["WHOOSH_STUN_URLS"]) if "WHOOSH_STUN_URLS" in env else defaults.stun_urls
+            ),
         )
 
     def origin_allowed(self, origin: str | None) -> bool:
