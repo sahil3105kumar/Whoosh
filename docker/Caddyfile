@@ -1,0 +1,8 @@
+# Caddy obtains and renews the TLS certificate for this domain
+# automatically. reverse_proxy handles WebSocket upgrades and sets
+# X-Forwarded-For from the real client address (incoming X-Forwarded-For
+# headers from clients are not trusted, so they can't be spoofed).
+{$WHOOSH_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy whoosh:8000
+}

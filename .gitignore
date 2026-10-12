@@ -48,6 +48,7 @@ apps/web/dist/
 # Environment
 .env
 .env.*
+!.env.example
 
 # Temporary
 tmp/
