@@ -37,6 +37,8 @@ class Settings:
     #: STUN server URLs handed to clients via GET /config. Clients learn
     #: their public address from these; TURN would go here too (v4.0).
     stun_urls: tuple[str, ...] = ("stun:stun.l.google.com:19302",)
+    #: Built web client (apps/web/dist) to serve at /. None = API only.
+    web_dir: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -56,6 +58,7 @@ class Settings:
             stun_urls=(
                 _csv(env["WHOOSH_STUN_URLS"]) if "WHOOSH_STUN_URLS" in env else defaults.stun_urls
             ),
+            web_dir=env.get("WHOOSH_WEB_DIR") or None,
         )
 
     def origin_allowed(self, origin: str | None) -> bool:

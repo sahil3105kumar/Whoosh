@@ -10,6 +10,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from apps.server.config import Settings
@@ -247,3 +248,8 @@ async def healthz() -> dict[str, str | float]:
     deployment guide you'll follow later expects one to exist.
     """
     return {"status": "ok", "time": time.time()}
+
+
+# Last, so every API route above takes precedence over static files.
+if settings.web_dir:
+    app.mount("/", StaticFiles(directory=settings.web_dir, html=True), name="web")

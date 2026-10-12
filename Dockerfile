@@ -1,5 +1,13 @@
 # syntax=docker/dockerfile:1
 
+# ── Web client: static files ────────────────────────────────────────
+FROM node:22-slim AS web
+WORKDIR /web
+COPY apps/web/package.json apps/web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY apps/web ./
+RUN npm run build
+
 # ── Build: resolve the locked dependencies into a venv ──────────────
 FROM python:3.12-slim AS build
 COPY --from=ghcr.io/astral-sh/uv:0.12.3 /uv /bin/uv
@@ -20,7 +28,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 FROM python:3.12-slim
 RUN useradd --system --uid 10001 --no-create-home whoosh
 COPY --from=build /app/.venv /app/.venv
-ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
+COPY --from=web /web/dist /app/web
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 WHOOSH_WEB_DIR=/app/web
 USER whoosh
 EXPOSE 8000
 

@@ -120,6 +120,7 @@ class Session:
             except ProtocolError as exc:
                 self._send_error("bad_message", str(exc))
                 continue
+            log.debug("recv %s", msg.type)
             await self._dispatch(msg)
 
         self.transfers.close("connection closed")
@@ -155,6 +156,7 @@ class Session:
         return self.peer_hello.done() and capability in self.peer_hello.result()
 
     def _send(self, msg_type: MessageType, payload: Payload) -> None:
+        log.debug("send %s", msg_type)
         self._peer.send(encode(make_message(msg_type, payload)).decode())
 
     def _send_error(self, code: str, message: str) -> None:

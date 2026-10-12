@@ -6,6 +6,7 @@
 tests
 docs
 dist
+apps/web/dist
 build
 node_modules
 apps/web/node_modules
