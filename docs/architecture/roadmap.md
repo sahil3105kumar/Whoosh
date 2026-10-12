@@ -96,23 +96,25 @@ way are recorded in [docs/decisions.md](../decisions.md). Suggested order: Phase
 
 ## Phase 4 — Web client (`apps/web`)
 
-- [ ] **12.** React + TypeScript + Vite on native WebRTC.
-- [ ] **13.** TypeScript protocol types generated from the Pydantic models
-      (`model_json_schema()` → `json-schema-to-typescript`).
-- [ ] **14.** Create/join, chat, send/receive with progress (File System
-      Access API, Blob fallback).
-- [ ] **15.** Browser ↔ CLI interop test.
+- [x] **12.** React + TypeScript + Vite + Tailwind on native WebRTC.
+- [x] **13.** TypeScript protocol types and runtime validation generated
+      from the Pydantic models (`scripts/gen_ts_protocol.py`, decision D36).
+- [x] **14.** Create/join (invite links), chat, ping, drag-and-drop send,
+      receive with progress, Save links (Blob storage, decision D38).
+- [x] **15.** Browser ↔ CLI and browser ↔ browser interop, verified by
+      hand in Chromium (decision D41; one unexplained failure, I1).
 
 ## Phase 5 — Ship
 
 - [x] **16. Docker.** Multi-stage `python:3.12-slim` + uv, server-only
       dependencies, non-root, health check. **Exactly one uvicorn
-      worker**, because room state is in memory. *Web client static files
-      join the image with Phase 4.*
+      worker**, because room state is in memory. Includes the built web
+      client.
 - [x] **17. docker-compose + Caddy.** Automatic HTTPS and WebSocket
       proxying (browsers require a secure context for WebRTC).
 - [ ] **18. Hosting.** One small Docker VPS; guide in
       [docs/deployment.md](../deployment.md). *Needs a server and domain.*
 - [x] **19. CI.** ruff, mypy (now clean), pytest (includes two real
       aiortc peers in-process), Docker build plus smoke test over real
-      sockets. *Web lint/build joins with Phase 4.*
+      sockets. Web typecheck, tests and build; generated types
+      checked for staleness.

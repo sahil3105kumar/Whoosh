@@ -7,8 +7,9 @@ The stack is two containers, defined in `docker/compose.yaml`:
 
 * **caddy**: terminates HTTPS (certificates obtained and renewed
   automatically) and proxies HTTP and WebSockets to the app.
-* **whoosh**: the signaling server. Its port is never published; Caddy
-  is the only way in (see [decisions](decisions.md) D30).
+* **whoosh**: the signaling server, which also serves the web app at
+  `/`. Its port is never published; Caddy is the only way in (see
+  [decisions](decisions.md) D30).
 
 ## Prerequisites
 
@@ -41,7 +42,9 @@ curl https://your.domain/healthz
 uv run python scripts/smoke_test.py https://your.domain
 ```
 
-Then a real transfer between two machines:
+Open `https://your.domain` in a browser: you should see the Whoosh
+home page. Then a real transfer between two machines (CLI, browser, or
+one of each):
 
 ```bash
 export WHOOSH_SERVER=https://your.domain

@@ -111,8 +111,21 @@ whoosh receive <room code>        # on the other machine
 
 Or chat: `whoosh create` / `whoosh join <room code>`, then `/send PATH`.
 
-Run a server locally with `uv run uvicorn apps.server.main:app`, or
-deploy one with Docker; see [docs/deployment.md](docs/deployment.md).
+Or use the web app: open the server's address in a browser, create a
+room, and share the invite link. It works with CLI peers too.
+
+## Development
+
+```bash
+uv sync                                    # Python: server, CLI, tests
+uv run uvicorn apps.server.main:app        # signaling server on :8000
+cd apps/web && npm install && npm run dev  # web app on :5173, proxied to :8000
+```
+
+After changing `packages/protocol`, regenerate the web client's types
+with `uv run python scripts/gen_ts_protocol.py`.
+
+Deploy with Docker; see [docs/deployment.md](docs/deployment.md).
 
 ## Documentation
 
