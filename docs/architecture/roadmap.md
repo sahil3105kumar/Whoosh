@@ -50,7 +50,8 @@
 
 # v1.0 — Path to Deployment
 
-Concrete work remaining to ship v1.0. Suggested order: Phase 1 → CLI chat
+Concrete work remaining to ship v1.0. Design decisions made along the
+way are recorded in [docs/decisions.md](../decisions.md). Suggested order: Phase 1 → CLI chat
 (8) → transfer (10) → STUN (6) → web client (12) → Docker (16).
 
 ## Phase 1 — Signaling server hardening
@@ -81,16 +82,16 @@ Concrete work remaining to ship v1.0. Suggested order: Phase 1 → CLI chat
 
 ## Phase 3 — Protocol & transfer
 
-- [ ] **8. CLI speaks the protocol.** `hello` capability exchange on channel
+- [x] **8. CLI speaks the protocol.** `hello` capability exchange on channel
       open, then an interactive stdin chat loop, via `packages/protocol/codec`.
-- [ ] **9. Surface handler errors.** `WebRTCPeer`'s `ensure_future` on
+- [x] **9. Surface handler errors.** `WebRTCPeer`'s `ensure_future` on
       incoming messages drops exceptions the same way the CLI listener did.
-- [ ] **10. `packages/transfer`.** `file_metadata` → chunks →
+- [x] **10. `packages/transfer`.** `file_metadata` → chunks →
       `transfer_complete`. Binary frames (small header with transfer id and
       chunk index) instead of base64-in-JSON; backpressure on
       `bufferedAmount`; throttled `progress`; cancel; SHA-256 in
       `transfer_complete`.
-- [ ] **11. CLI commands.** `whoosh send FILE`, `whoosh receive ROOM_ID`;
+- [x] **11. CLI commands.** `whoosh send FILE`, `whoosh receive ROOM_ID`;
       `[project.scripts]` entry for `uv tool install` / `pipx`.
 
 ## Phase 4 — Web client (`apps/web`)

@@ -59,7 +59,7 @@ After the WebRTC connection is established, the signaling server is no longer in
 ### CLI
 
 * Python
-* Typer
+* argparse
 * aiortc
 
 ### Testing
@@ -100,6 +100,7 @@ whoosh/
 * Architecture
 * Protocol
 * Roadmap
+* [Decisions](docs/decisions.md)
 
 ## Roadmap
 
