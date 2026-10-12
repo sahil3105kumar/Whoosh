@@ -14,6 +14,7 @@ import json
 import logging
 import sys
 import urllib.request
+from typing import Any
 
 import websockets
 
@@ -44,45 +45,62 @@ async def _run(server: str, room_id: str, is_creator: bool) -> None:
             on_message=lambda data: _on_data(data),
         )
 
+        async def _listen_signaling() -> None:
+            try:
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    t = msg.get("type")
+
+                    if t == "hello":
+                        log.info("Connected (peer_id=%s)", msg["peer_id"])
+
+                    elif t == "peer_joined":
+                        if is_creator:
+                            log.info("Peer joined — initiating WebRTC...")
+                            await peer.create_offer()
+
+                    elif t in ("offer", "answer"):
+                        await peer.handle_signaling(msg)
+
+                    elif t == "peer_disconnected":
+                        log.warning("Peer dropped from signaling.")
+
+                    elif t == "peer_left":
+                        log.warning("Peer left the room.")
+            except websockets.exceptions.ConnectionClosed:
+                pass
+
+        listen_task = asyncio.create_task(_listen_signaling())
+
         try:
-            async for raw in ws:
-                msg = json.loads(raw)
-                t = msg.get("type")
+            # Race the DataChannel against the listener so a signaling
+            # failure surfaces immediately instead of as a timeout.
+            waiters: set[asyncio.Future[Any]] = {peer.channel_ready, listen_task}
+            await asyncio.wait(
+                waiters,
+                timeout=10.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if listen_task.done():
+                listen_task.result()  # re-raise the listener's exception, if any
 
-                if t == "hello":
-                    log.info("Connected (peer_id=%s)", msg["peer_id"])
+            if not peer.channel_ready.done():
+                if listen_task.done():
+                    log.error("Signaling closed before the DataChannel opened.")
+                else:
+                    log.error("Timed out waiting for DataChannel.")
+                sys.exit(1)
 
-                elif t == "peer_joined":
-                    if is_creator:
-                        log.info("Peer joined — initiating WebRTC...")
-                        await peer.create_offer()
-
-                elif t in ("offer", "answer"):
-                    await peer.handle_signaling(msg)
-
-                    # After processing signaling, check if channel is ready
-                    if peer.channel_ready.done():
-                        break
-
-                elif t == "peer_disconnected":
-                    log.warning("Peer dropped from signaling.")
-
-                # After every message, check if the channel came up
-                if peer.channel_ready.done():
-                    break
-
-            # Wait for DataChannel (may already be done)
-            await asyncio.wait_for(peer.channel_ready, timeout=10.0)
             print("\n✓ P2P Connection Established!")
 
             assert peer.channel is not None
             peer.channel.send("hello from CLI")
             await asyncio.sleep(1)  # let the other side's message arrive
 
-        except TimeoutError:
-            log.error("Timed out waiting for DataChannel.")
-            sys.exit(1)
+            if listen_task.done():
+                listen_task.result()
         finally:
+            listen_task.cancel()
             await peer.close()
 
 
