@@ -21,12 +21,9 @@ from packages.protocol.exceptions import (
 from packages.protocol.models import (
     ChatPayload,
     ErrorPayload,
-    FileChunkPayload,
     FileMetadataPayload,
     HelloPayload,
     Payload,
-    PeerJoinPayload,
-    PeerLeavePayload,
     PingPayload,
     PongPayload,
     ProgressPayload,
@@ -40,15 +37,12 @@ PAYLOAD_REGISTRY: dict[MessageType, type[Payload]] = {
     MessageType.HELLO: HelloPayload,
     MessageType.CHAT: ChatPayload,
     MessageType.FILE_METADATA: FileMetadataPayload,
-    MessageType.FILE_CHUNK: FileChunkPayload,
     MessageType.PROGRESS: ProgressPayload,
     MessageType.TRANSFER_COMPLETE: TransferCompletePayload,
     MessageType.TRANSFER_CANCEL: TransferCancelPayload,
     MessageType.ERROR: ErrorPayload,
     MessageType.PING: PingPayload,
     MessageType.PONG: PongPayload,
-    MessageType.PEER_JOIN: PeerJoinPayload,
-    MessageType.PEER_LEAVE: PeerLeavePayload,
 }
 
 
@@ -99,11 +93,16 @@ def decode(data: bytes) -> ProtocolMessage:
         raise UnknownMessageTypeError(raw_type or "<missing>") from err
 
     # 4. Ensure we have a registered payload model
-    if get_payload_model(msg_type) is None:
+    payload_model = get_payload_model(msg_type)
+    if payload_model is None:
         raise UnknownMessageTypeError(str(msg_type))
 
-    # 5. Full Pydantic validation
+    # 5. Validate the payload against the model registered for *this*
+    #    type first. AnyPayload is an undiscriminated union and several
+    #    payloads share a shape (ping/pong, complete/cancel), so letting
+    #    the union pick would hand back the wrong class.
     try:
-        return ProtocolMessage.model_validate(raw)
+        payload = payload_model.model_validate(raw.get("payload"))
+        return ProtocolMessage.model_validate({**raw, "payload": payload})
     except ValidationError as exc:
         raise MessageDecodeError(str(exc)) from exc

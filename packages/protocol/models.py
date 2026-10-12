@@ -45,14 +45,6 @@ class FileMetadataPayload(Payload):
     mime_type: str = "application/octet-stream"
 
 
-class FileChunkPayload(Payload):
-    """A single chunk of a file transfer (base64-encoded for JSON transport)."""
-
-    transfer_id: str
-    chunk_index: int
-    data: str  # base64-encoded binary data
-
-
 class ProgressPayload(Payload):
     """Transfer progress update."""
 
@@ -62,9 +54,15 @@ class ProgressPayload(Payload):
 
 
 class TransferCompletePayload(Payload):
-    """Signals that a file transfer finished successfully."""
+    """Signals that a file transfer finished successfully.
+
+    Sent by the sender after the last chunk, then echoed back by the
+    receiver once the file is verified and saved. ``sha256`` is the
+    hex digest of the whole file.
+    """
 
     transfer_id: str
+    sha256: str
 
 
 class TransferCancelPayload(Payload):
@@ -93,18 +91,6 @@ class PongPayload(Payload):
     timestamp: float
 
 
-class PeerJoinPayload(Payload):
-    """Notification that a peer joined the room."""
-
-    peer_id: str
-
-
-class PeerLeavePayload(Payload):
-    """Notification that a peer left the room."""
-
-    peer_id: str
-
-
 # ---------------------------------------------------------------------------
 # Discriminated union of all payload types
 # ---------------------------------------------------------------------------
@@ -113,15 +99,12 @@ AnyPayload = Annotated[
     HelloPayload
     | ChatPayload
     | FileMetadataPayload
-    | FileChunkPayload
     | ProgressPayload
     | TransferCompletePayload
     | TransferCancelPayload
     | ErrorPayload
     | PingPayload
-    | PongPayload
-    | PeerJoinPayload
-    | PeerLeavePayload,
+    | PongPayload,
     Field(discriminator=None),
 ]
 

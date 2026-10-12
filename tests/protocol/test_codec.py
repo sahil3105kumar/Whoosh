@@ -19,11 +19,8 @@ from packages.protocol.exceptions import (
 from packages.protocol.models import (
     ChatPayload,
     ErrorPayload,
-    FileChunkPayload,
     FileMetadataPayload,
     HelloPayload,
-    PeerJoinPayload,
-    PeerLeavePayload,
     PingPayload,
     PongPayload,
     ProgressPayload,
@@ -75,15 +72,6 @@ class TestRoundTrips:
         assert decoded.payload.filename == "notes.txt"
         assert decoded.payload.size == 1024
 
-    def test_file_chunk(self):
-        original = make_message(
-            MessageType.FILE_CHUNK,
-            FileChunkPayload(transfer_id="t1", chunk_index=0, data="AQIDBA=="),
-        )
-        decoded = _roundtrip(original)
-        assert decoded.payload.chunk_index == 0
-        assert decoded.payload.data == "AQIDBA=="
-
     def test_progress(self):
         original = make_message(
             MessageType.PROGRESS,
@@ -95,7 +83,7 @@ class TestRoundTrips:
     def test_transfer_complete(self):
         original = make_message(
             MessageType.TRANSFER_COMPLETE,
-            TransferCompletePayload(transfer_id="t1"),
+            TransferCompletePayload(transfer_id="t1", sha256="ab" * 32),
         )
         decoded = _roundtrip(original)
         assert decoded.type == MessageType.TRANSFER_COMPLETE
@@ -127,16 +115,6 @@ class TestRoundTrips:
         original = make_message(MessageType.PONG, PongPayload(timestamp=ts))
         decoded = _roundtrip(original)
         assert decoded.payload.timestamp == ts
-
-    def test_peer_join(self):
-        original = make_message(MessageType.PEER_JOIN, PeerJoinPayload(peer_id="abc"))
-        decoded = _roundtrip(original)
-        assert decoded.payload.peer_id == "abc"
-
-    def test_peer_leave(self):
-        original = make_message(MessageType.PEER_LEAVE, PeerLeavePayload(peer_id="abc"))
-        decoded = _roundtrip(original)
-        assert decoded.payload.peer_id == "abc"
 
 
 # ---------------------------------------------------------------------------
@@ -220,3 +198,20 @@ class TestRegistry:
     def test_unknown_type_returns_none(self):
         # A fabricated value that isn't in the enum
         assert get_payload_model("totally_fake") is None
+
+
+class TestPayloadClassMatchesType:
+    """Payloads with identical shapes must still decode to their own class."""
+
+    @pytest.mark.parametrize(
+        ("msg_type", "payload"),
+        [
+            (MessageType.PING, {"timestamp": 1.0}),
+            (MessageType.PONG, {"timestamp": 1.0}),
+            (MessageType.TRANSFER_CANCEL, {"transfer_id": "t1"}),
+            (MessageType.TRANSFER_COMPLETE, {"transfer_id": "t1", "sha256": "ab"}),
+        ],
+    )
+    def test_decoded_payload_class(self, msg_type, payload):
+        raw = json.dumps({"version": 1, "type": msg_type, "payload": payload}).encode()
+        assert type(decode(raw).payload) is get_payload_model(msg_type)
