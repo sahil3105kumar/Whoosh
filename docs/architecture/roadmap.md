@@ -63,11 +63,13 @@ Concrete work remaining to ship v1.0. Suggested order: Phase 1 → CLI chat
 - [x] **3. Grace-period slot release.** After a WebSocket drops, call
       `leave_room` if the peer hasn't reconnected within a grace period,
       instead of holding the slot for the full room TTL.
-- [ ] **4. Abuse limits.** Per-IP rate limit on `POST /rooms`, WebSocket
+- [x] **4. Abuse limits.** Per-IP rate limit on `POST /rooms`, WebSocket
       message size cap, relay only signaling types (`offer`, `answer`,
       `ice`), `Origin` check.
-- [ ] **5. Config via environment.** TTL, grace period, allowed origins,
-      ICE servers, log level. Quiet aiortc's per-candidate INFO logging.
+- [x] **5. Config via environment.** `WHOOSH_*` variables in
+      `apps/server/config.py` (TTL, grace period, allowed origins, room
+      creation rate, max message size, log level). ICE servers land with
+      item 6. CLI no longer logs every ICE candidate check.
 
 ## Phase 2 — NAT traversal
 

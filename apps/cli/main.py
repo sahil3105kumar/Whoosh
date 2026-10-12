@@ -21,6 +21,8 @@ import websockets
 from packages.rtc.peer import WebRTCPeer
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+# aioice logs every ICE candidate-pair check at INFO — dozens of lines per connect
+logging.getLogger("aioice").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 

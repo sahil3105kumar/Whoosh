@@ -163,3 +163,65 @@ async def test_invalid_json_frees_socket_registration():
             assert exc_info.value.code == 1007
 
     assert not connection_manager.is_connected(room_id, hello["peer_id"])
+
+
+async def _expect_close(ws, code: int) -> None:
+    from httpx_ws import WebSocketDisconnect
+
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        await ws.receive_json()
+    assert exc_info.value.code == code
+
+
+async def test_unrelayable_type_gets_error_and_connection_stays_open():
+    room_id = await _create_room()
+
+    async with _http_client() as client:
+        async with aconnect_ws(f"/rooms/{room_id}/ws", client) as ws:
+            await ws.receive_json()  # hello
+            await ws.send_json({"type": "peer_joined", "peer_id": "spoofed"})
+            err = await ws.receive_json()
+            assert err["type"] == "error"
+            assert "peer_joined" in err["reason"]
+
+            # Still usable afterwards
+            await ws.send_json({"type": "nope"})
+            assert (await ws.receive_json())["type"] == "error"
+
+
+async def test_oversized_message_closes_with_1009(monkeypatch: pytest.MonkeyPatch):
+    from apps.server import main
+    from apps.server.config import Settings
+
+    monkeypatch.setattr(main, "settings", Settings(max_message_bytes=100))
+    room_id = await _create_room()
+
+    async with _http_client() as client:
+        async with aconnect_ws(f"/rooms/{room_id}/ws", client) as ws:
+            await ws.receive_json()  # hello
+            await ws.send_json({"type": "offer", "sdp": "x" * 200})
+            await _expect_close(ws, 1009)
+
+
+async def test_binary_frame_closes_with_1003():
+    room_id = await _create_room()
+
+    async with _http_client() as client:
+        async with aconnect_ws(f"/rooms/{room_id}/ws", client) as ws:
+            await ws.receive_json()  # hello
+            await ws.send_bytes(b"\x00\x01")
+            await _expect_close(ws, 1003)
+
+
+async def test_disallowed_origin_closes_with_1008(monkeypatch: pytest.MonkeyPatch):
+    from apps.server import main
+    from apps.server.config import Settings
+
+    monkeypatch.setattr(main, "settings", Settings(allowed_origins=("https://ok.example",)))
+    room_id = await _create_room()
+
+    async with _http_client() as client:
+        async with aconnect_ws(
+            f"/rooms/{room_id}/ws", client, headers={"Origin": "https://evil.example"}
+        ) as ws:
+            await _expect_close(ws, 1008)
