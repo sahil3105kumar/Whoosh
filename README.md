@@ -125,6 +125,14 @@ cd apps/web && npm install && npm run dev  # web app on :5173, proxied to :8000
 After changing `packages/protocol`, regenerate the web client's types
 with `uv run python scripts/gen_ts_protocol.py`.
 
+Browser ↔ CLI interop tests (headless Chromium):
+
+```bash
+uv sync --group interop && uv run playwright install chromium
+(cd apps/web && npm run build)
+uv run pytest tests/interop
+```
+
 Deploy with Docker; see [docs/deployment.md](docs/deployment.md).
 
 ## Documentation

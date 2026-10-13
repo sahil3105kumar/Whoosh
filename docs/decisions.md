@@ -478,20 +478,43 @@ is a project of its own.
 **Revisit** — Before the next protocol change: an automated interop
 test is the only thing that would catch a regression like D24 or D15
 across the two implementations.
+*Superseded by D42.*
+
+### D42. Automated browser ↔ CLI interop tests with Playwright
+*2026-10-13 — supersedes D41's manual verification*
+
+**Decision** — `tests/interop/` runs a real server, the built web client
+in headless Chromium (Python Playwright) and the CLI as a subprocess:
+browser → CLI and CLI → browser transfers (the latter 5× per run, for
+I1), chat and ping both ways, and browser ↔ browser. Files are checked
+byte for byte. Playwright lives in a separate `interop` dependency
+group with its own CI job; without it (or without a web build) the
+tests skip, so a plain `uv run pytest` needs no browser.
+**Why** — The only check that the Python and TypeScript implementations
+still agree. ~20s per run. STUN is disabled in the test server: the
+peers share a machine, and gathering is slow on hosts with many
+interfaces.
+**Gotcha** — The first version read the CLI's stdout only when waiting
+for a line. With `-v` the receiving CLI logs every SCTP chunk, the
+64 KB pipe filled, and the CLI's event loop blocked mid-transfer. That
+looked exactly like an app bug (upload stuck at 0%). The harness now
+drains output continuously.
 
 ---
 
 ## Open issues
 
 ### I1. One lost `hello` with the CLI creating and a browser joining
-*Observed 2026-10-12, once in six runs; not reproduced since.*
+*Observed 2026-10-12, once in six manual runs. Not reproduced in 25
+further runs: 5 manual and 20 automated (D42).*
 
 The CLI (`whoosh send`) connected but never received the browser's
 `hello` and gave up after 10s. The browser showed "Connected". Five
 later runs of the same setup succeeded, and logs from them show
 `hello` sent and received in order. The CLI now logs every DataChannel
 message type with `-v`; capture that output and the browser console if
-it happens again.
+it happens again. The interop suite repeats this scenario on every CI
+run, so a recurrence there would come with full CLI output.
 
 ### I2. Browser → CLI transfers are slower than the reverse
 *Observed 2026-10-12.*

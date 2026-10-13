@@ -101,8 +101,8 @@ way are recorded in [docs/decisions.md](../decisions.md). Suggested order: Phase
       from the Pydantic models (`scripts/gen_ts_protocol.py`, decision D36).
 - [x] **14.** Create/join (invite links), chat, ping, drag-and-drop send,
       receive with progress, Save links (Blob storage, decision D38).
-- [x] **15.** Browser ↔ CLI and browser ↔ browser interop, verified by
-      hand in Chromium (decision D41; one unexplained failure, I1).
+- [x] **15.** Browser ↔ CLI and browser ↔ browser interop: automated
+      Playwright suite in CI (decision D42; open issue I1).
 
 ## Phase 5 — Ship
 
