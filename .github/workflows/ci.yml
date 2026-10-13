@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0 # no floating major tags for this action
         with:
           enable-cache: true
 
@@ -87,7 +87,7 @@ jobs:
           docker logs whoosh
           exit 1
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0 # no floating major tags for this action
         with:
           enable-cache: true
 
