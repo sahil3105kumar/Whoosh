@@ -43,6 +43,11 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "ruff>=0.15.22",
 ]
+# Browser <-> CLI tests (tests/interop). Not installed by default:
+#   uv sync --group interop && uv run playwright install chromium
+interop = [
+    "playwright>=1.63",
+]
 
 [tool.ruff]
 line-length = 100
@@ -63,6 +68,7 @@ indent-style = "space"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = ["interop: real browser + CLI + server (needs the interop group and a web build)"]
 testpaths = ["tests"]
 pythonpath = ["."]
 
