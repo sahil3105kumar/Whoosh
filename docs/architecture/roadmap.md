@@ -118,3 +118,27 @@ way are recorded in [docs/decisions.md](../decisions.md). Suggested order: Phase
       aiortc peers in-process), Docker build plus smoke test over real
       sockets. Web typecheck, tests and build; generated types
       checked for staleness.
+
+---
+
+# Milestone tracking
+
+Where each GitHub issue is implemented and how it's verified. Design
+choices that differ from an issue's wording are recorded in
+[docs/decisions.md](../decisions.md).
+
+## v1.0 — MVP
+
+| Issue | Implementation | Verified by |
+|---|---|---|
+| #2 Room creation | `POST /rooms`, `packages/signaling/room_manager.py` | `tests/server/test_rooms.py` |
+| #3 Room joining | `ConnectionManager.connect`, reconnection by `peer_id` | `tests/signaling/` |
+| #4 WebSocket signaling | `/rooms/{id}/ws` relay (D2, D4, D5) | `tests/server/test_ws_signaling.py`, `scripts/smoke_test.py` |
+| #5 SDP negotiation | Offer/answer over signaling: `packages/rtc/peer.py`, `apps/web/src/lib/connection.ts` | `tests/rtc/test_peer.py`, interop suite |
+| #6 ICE candidate exchange | Candidates carried inside the SDP once gathering completes (D35); STUN servers served by `GET /config` (D10). The relay also accepts trickled `ice` messages | interop suite |
+| #7 WebRTC DataChannel | One reliable, ordered channel per connection; ordered receive queue and backpressure (D21, D24) | `tests/rtc/test_peer.py` |
+| #8 Peer-to-peer chat | `chat` messages through the shared protocol, both clients | `test_chat_and_ping_both_ways` |
+| #9 Streaming large file transfer | `packages/transfer`, `apps/web/src/lib/transfer.ts`: chunked, never whole-file in memory on the sender | `tests/transfer/`, `transfer.test.ts`, interop suite |
+| #10 Progress reporting | Progress callbacks on both sides; CLI progress line, web progress bars (D18) | `test_progress_updates_reach_completion` |
+| #11 Web client | `apps/web` (React, TypeScript, Vite, Tailwind) | vitest, interop suite |
+| #12 Python CLI | `apps/cli`: `create`/`join`/`send`/`receive`. Built on argparse rather than Typer (D27) | interop suite, `tests/` |
