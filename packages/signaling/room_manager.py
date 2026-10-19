@@ -113,6 +113,18 @@ class RoomManager:
         elif len(room.peer_ids) == 1:
             room.state = RoomState.WAITING
 
+    def evict_expired(self, *, now: float | None = None) -> int:
+        """Evict every expired room and return how many were removed.
+
+        get_room() only evicts rooms that someone looks up; this is
+        the periodic sweep that catches rooms nobody comes back to.
+        """
+        expired = [rid for rid, room in self._rooms.items() if room.is_expired(now=now)]
+        for rid in expired:
+            self._rooms[rid].state = RoomState.EXPIRED
+            del self._rooms[rid]
+        return len(expired)
+
     def room_count(self) -> int:
         """Number of rooms currently tracked (including any not yet
         lazily evicted for expiry). Mainly useful for tests and

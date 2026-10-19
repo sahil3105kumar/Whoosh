@@ -6,6 +6,8 @@ Uses a mock WebSocket to test ConnectionManager in isolation.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock
 
 import pytest
@@ -15,19 +17,21 @@ from packages.signaling.enums import RoomState
 from packages.signaling.exceptions import RoomFullError
 from packages.signaling.room_manager import RoomManager
 
+#: Short grace period so slot-release tests don't sleep for long.
+GRACE = 0.05
+
 
 def _make_ws() -> AsyncMock:
     """Create a mock WebSocket."""
-    ws = AsyncMock()
-    ws.send_json = AsyncMock()
-    return ws
+    return AsyncMock()
 
 
 @pytest.fixture
-def manager() -> tuple[RoomManager, ConnectionManager]:
+async def manager() -> AsyncIterator[tuple[RoomManager, ConnectionManager]]:
     rm = RoomManager()
-    cm = ConnectionManager(rm)
-    return rm, cm
+    cm = ConnectionManager(rm, reconnect_grace_seconds=GRACE)
+    yield rm, cm
+    await cm.shutdown()
 
 
 async def test_connect_assigns_peer_id(manager):
@@ -72,7 +76,7 @@ async def test_reconnect_with_existing_peer_id(manager):
     pid = await cm.connect(room.id, ws1)
 
     # Simulate disconnect
-    await cm.disconnect(room.id, pid)
+    await cm.disconnect(room.id, pid, ws1)
     assert not cm.is_connected(room.id, pid)
 
     # Reconnect with same peer_id
@@ -117,7 +121,7 @@ async def test_disconnect_notifies_remaining_peer(manager):
     ws_a.send_json.reset_mock()
     ws_b.send_json.reset_mock()
 
-    await cm.disconnect(room.id, pid_a)
+    await cm.disconnect(room.id, pid_a, ws_a)
 
     # B should receive peer_disconnected
     ws_b.send_json.assert_called_once_with({"type": "peer_disconnected", "peer_id": pid_a})
@@ -132,7 +136,7 @@ async def test_disconnect_does_not_remove_from_room(manager):
     ws = _make_ws()
 
     pid = await cm.connect(room.id, ws)
-    await cm.disconnect(room.id, pid)
+    await cm.disconnect(room.id, pid, ws)
 
     # Peer still in room, just no active WebSocket
     assert pid in room.peer_ids
@@ -141,4 +145,60 @@ async def test_disconnect_does_not_remove_from_room(manager):
 
 async def test_disconnect_unknown_room_is_noop(manager):
     _, cm = manager
-    await cm.disconnect("nonexistent", "peer1")  # should not raise
+    await cm.disconnect("nonexistent", "peer1", _make_ws())  # should not raise
+
+
+async def test_stale_socket_disconnect_does_not_drop_reconnected_peer(manager):
+    rm, cm = manager
+    room = rm.create_room()
+    old_ws = _make_ws()
+    pid = await cm.connect(room.id, old_ws)
+
+    # Peer reconnects on a new socket before the old one's cleanup runs
+    new_ws = _make_ws()
+    await cm.connect(room.id, new_ws, peer_id=pid)
+    await cm.disconnect(room.id, pid, old_ws)
+
+    assert cm.is_connected(room.id, pid)
+
+
+async def test_slot_released_after_grace_period(manager):
+    rm, cm = manager
+    room = rm.create_room()
+    ws_a = _make_ws()
+    ws_b = _make_ws()
+    pid_a = await cm.connect(room.id, ws_a)
+    await cm.connect(room.id, ws_b)
+
+    await cm.disconnect(room.id, pid_a, ws_a)
+    await asyncio.sleep(GRACE * 3)
+
+    assert pid_a not in room.peer_ids
+    assert room.state == RoomState.WAITING
+    ws_b.send_json.assert_called_with({"type": "peer_left", "peer_id": pid_a})
+
+
+async def test_reconnect_within_grace_keeps_slot(manager):
+    rm, cm = manager
+    room = rm.create_room()
+    ws = _make_ws()
+    pid = await cm.connect(room.id, ws)
+
+    await cm.disconnect(room.id, pid, ws)
+    await cm.connect(room.id, _make_ws(), peer_id=pid)
+    await asyncio.sleep(GRACE * 3)
+
+    assert pid in room.peer_ids
+    assert cm.is_connected(room.id, pid)
+
+
+async def test_relay_skips_dead_socket(manager):
+    rm, cm = manager
+    room = rm.create_room()
+    ws_a = _make_ws()
+    dead = _make_ws()
+    dead.send_json.side_effect = RuntimeError("socket closed")
+    pid_a = await cm.connect(room.id, ws_a)
+    await cm.connect(room.id, dead)
+
+    await cm.relay(room.id, pid_a, {"type": "offer", "sdp": "..."})  # should not raise

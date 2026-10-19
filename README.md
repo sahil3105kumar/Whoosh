@@ -59,7 +59,7 @@ After the WebRTC connection is established, the signaling server is no longer in
 ### CLI
 
 * Python
-* Typer
+* argparse
 * aiortc
 
 ### Testing
@@ -93,6 +93,48 @@ whoosh/
 └── scripts/
 ```
 
+## Quick start
+
+Install the CLI:
+
+```bash
+uv tool install "whoosh[cli] @ git+https://github.com/sahil3105kumar/Whoosh"
+```
+
+Send a file:
+
+```bash
+export WHOOSH_SERVER=https://your.whoosh.server
+whoosh send report.pdf            # prints a room code
+whoosh receive <room code>        # on the other machine
+```
+
+Or chat: `whoosh create` / `whoosh join <room code>`, then `/send PATH`.
+
+Or use the web app: open the server's address in a browser, create a
+room, and share the invite link. It works with CLI peers too.
+
+## Development
+
+```bash
+uv sync                                    # Python: server, CLI, tests
+uv run uvicorn apps.server.main:app        # signaling server on :8000
+cd apps/web && npm install && npm run dev  # web app on :5173, proxied to :8000
+```
+
+After changing `packages/protocol`, regenerate the web client's types
+with `uv run python scripts/gen_ts_protocol.py`.
+
+Browser ↔ CLI interop tests (headless Chromium):
+
+```bash
+uv sync --group interop && uv run playwright install chromium
+(cd apps/web && npm run build)
+uv run pytest tests/interop
+```
+
+Deploy with Docker; see [docs/deployment.md](docs/deployment.md).
+
 ## Documentation
 
 * Vision
@@ -100,6 +142,8 @@ whoosh/
 * Architecture
 * Protocol
 * Roadmap
+* [Decisions](docs/decisions.md)
+* [Deployment](docs/deployment.md)
 
 ## Roadmap
 

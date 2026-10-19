@@ -1,0 +1,40 @@
+# Production stack: Caddy (HTTPS, WebSocket proxying) in front of the
+# signaling server. See docs/deployment.md.
+#
+#   cp docker/.env.example docker/.env   # then set WHOOSH_DOMAIN
+#   docker compose -f docker/compose.yaml up -d --build
+
+services:
+  whoosh:
+    build: ..
+    image: whoosh-server
+    restart: unless-stopped
+    environment:
+      WHOOSH_ALLOWED_ORIGINS: ${WHOOSH_ALLOWED_ORIGINS:-https://${WHOOSH_DOMAIN}}
+      WHOOSH_LOG_LEVEL: ${WHOOSH_LOG_LEVEL:-INFO}
+      WHOOSH_ROOM_CREATE_PER_MINUTE: ${WHOOSH_ROOM_CREATE_PER_MINUTE:-10}
+    # Internal only. Never publish this port: uvicorn trusts forwarded
+    # headers from any source, which is safe only behind Caddy (D30).
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "${WHOOSH_HTTP_PORT:-80}:80"
+      - "${WHOOSH_HTTPS_PORT:-443}:443"
+      - "${WHOOSH_HTTPS_PORT:-443}:443/udp" # HTTP/3
+    environment:
+      WHOOSH_DOMAIN: ${WHOOSH_DOMAIN:?set WHOOSH_DOMAIN in docker/.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # certificates — keep across restarts
+      - caddy_config:/config
+    depends_on:
+      whoosh:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

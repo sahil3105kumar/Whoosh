@@ -48,3 +48,11 @@ def test_create_room_registers_with_room_manager():
     client.post("/rooms")
     after = room_manager.room_count()
     assert after == before + 1
+
+
+def test_config_returns_ice_servers():
+    response = client.get("/config")
+
+    assert response.status_code == 200
+    ice_servers = response.json()["ice_servers"]
+    assert ice_servers and all(url.startswith("stun:") for url in ice_servers[0]["urls"])

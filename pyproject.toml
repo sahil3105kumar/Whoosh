@@ -4,13 +4,37 @@ version = "0.1.0"
 description = "A p2p chat and file-sharing utility"
 readme = "README.md"
 requires-python = ">=3.12"
+# Shared by both apps: just the protocol models. Each app's own stack is
+# an extra so the server image doesn't carry WebRTC (docs/decisions.md D31).
 dependencies = [
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+cli = [
+    "aiortc>=1.15.0",
+    "websockets>=17.0.1",
+]
+server = [
     "fastapi>=0.141.0",
     "uvicorn>=0.30.0",
+    # uvicorn answers WebSocket upgrades with 404 unless a WS library is installed
+    "websockets>=17.0.1",
 ]
+
+[project.scripts]
+whoosh = "apps.cli.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["apps", "packages"]
 
 [dependency-groups]
 dev = [
+    "whoosh[cli,server]",
     "httpx>=0.27.0",
     "httpx-ws>=0.9.0",
     "mypy>=2.3.0",
@@ -18,6 +42,11 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.15.22",
+]
+# Browser <-> CLI tests (tests/interop). Not installed by default:
+#   uv sync --group interop && uv run playwright install chromium
+interop = [
+    "playwright>=1.63",
 ]
 
 [tool.ruff]
@@ -39,9 +68,12 @@ indent-style = "space"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = ["interop: real browser + CLI + server (needs the interop group and a web build)"]
 testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
+files = ["apps", "packages"]
+explicit_package_bases = true
