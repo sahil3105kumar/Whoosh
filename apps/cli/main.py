@@ -31,6 +31,7 @@ from pathlib import Path
 
 from websockets.exceptions import WebSocketException
 
+from apps.cli import history
 from apps.cli.connection import RECONNECT_TIMEOUT, ConnectError, Link, create_room
 from apps.cli.queue import SendQueue
 from apps.cli.session import Session, Ui, format_bytes
@@ -360,7 +361,33 @@ def _parser() -> argparse.ArgumentParser:
     r = sub.add_parser("receive", help="Join a room, save incoming files, exit")
     r.add_argument("room", type=room_ref, help=room_help)
     r.add_argument("--out", default=".", help=out_help)
+    h = sub.add_parser("history", help="Show past transfers (kept only on this machine)")
+    h.add_argument("-n", type=int, default=20, help="How many to show (default 20)")
+    h.add_argument("--clear", action="store_true", help="Delete the history")
     return p
+
+
+def _show_history(args: argparse.Namespace, ui: Ui) -> None:
+    if args.clear:
+        history.clear()
+        ui.ok("History cleared.")
+        return
+    entries = history.load()[-args.n :]
+    if not entries:
+        where = "disabled (WHOOSH_NO_HISTORY)" if not history.enabled() else "empty"
+        ui.hint(f"No transfers yet; history is {where}.")
+        return
+    for e in reversed(entries):
+        when = e.time.replace("T", " ").split("+")[0]
+        arrow = "↑" if e.direction == "send" else "↓"
+        if e.status == "completed":
+            outcome = ui.style.ok("done")
+        else:
+            outcome = ui.style.error(f"{e.status}: {e.reason}")
+        ui.line(f"{ui.style.dim(when)}  {arrow} {e.filename} ({format_bytes(e.size)})  {outcome}")
+        if e.status == "completed":
+            ui.line(ui.style.dim(f"    {e.path}  sha256 {e.sha256[:16]}…"))
+    ui.hint(f"\n{history.history_path()}")
 
 
 def main() -> None:
@@ -369,6 +396,9 @@ def main() -> None:
     if args.cmd is None:
         p.print_help()
         sys.exit(2)
+    if args.cmd == "history":
+        _show_history(args, Ui())
+        return
 
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(

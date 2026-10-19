@@ -322,6 +322,12 @@ async def test_browser_to_browser(server: str, browser: Browser):
     expected = hashlib.sha256(pattern_bytes(3_000_000, seed=7)).hexdigest()
     assert await received_sha256(bob, "between-browsers.bin") == expected
 
+    # History (#22): both sides list it on the home page after leaving
+    for page in (alice, bob):
+        await page.get_by_role("button", name="Leave").click()
+        await page.get_by_text("Recent transfers").wait_for(timeout=TIMEOUT_S * 1000)
+        assert await page.get_by_text("between-browsers.bin").count() == 1
+
 
 # ── Resume (#17) ────────────────────────────────────────────────────
 

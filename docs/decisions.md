@@ -717,3 +717,21 @@ byte (minutes, for a large file). At the end it's computed while
 streaming, for free. Per-chunk checksums would duplicate what DTLS
 (authenticated encryption) and SCTP (CRC32c) already guarantee in
 transit.
+
+### D54. Transfer history: local only, metadata only, easy to turn off
+*2026-10-19 — #22*
+
+**Decision** — Each client records finished transfers on its own
+machine: the CLI in `$XDG_STATE_HOME/whoosh/history.jsonl` (`whoosh
+history`, `--clear`; `WHOOSH_HISTORY_FILE` moves it, `WHOOSH_NO_HISTORY=1`
+disables it; trimmed to 1000 entries), the web client in `localStorage`
+("Recent transfers" on the home page with **Clear**; 200 entries).
+Entries hold time, direction, name, size, outcome and, in the CLI, path
+and verified SHA-256. Received file contents are never kept by history.
+**Why** — #22 requires the server to stay stateless about user data.
+JSON Lines appends cheaply and survives a crash mid-write (a torn last
+line is skipped on read). History is a convenience, so failures to
+write it (full disk, blocked storage) are silent.
+**Note** — The test suite sets `WHOOSH_NO_HISTORY` for everything except
+history's own tests; otherwise the interop tests' CLI processes would
+write into the developer's real history.

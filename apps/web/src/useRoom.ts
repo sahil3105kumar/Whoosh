@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { type ConnectPhase, Link, type PeerChannel } from "./lib/connection";
+import { recordTransfer } from "./lib/history";
 import { type QueuedFile, SendQueue } from "./lib/queue";
 import { Session } from "./lib/session";
 import type { Transfer } from "./lib/transfer";
@@ -50,11 +51,13 @@ export function useRoom(roomId: string, isCreator: boolean) {
       {
         onChat: (text) => addLog("peer", text),
         onNotice: (text) => addLog("system", text),
-        onTransfer: (t) =>
+        onTransfer: (t) => {
+          if (t.status !== "streaming") recordTransfer(t); // reported once, when it ends
           setTransfers((list) => {
             const i = list.findIndex((x) => x.id === t.id);
             return i === -1 ? [...list, t] : list.with(i, t);
-          }),
+          });
+        },
         onPeerReady: () => setPeerReady(true),
         onLatency: (ms) => {
           setLatencyMs(ms);

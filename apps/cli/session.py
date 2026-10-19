@@ -17,6 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
+from apps.cli import history
 from packages.protocol.codec import decode, encode
 from packages.protocol.enums import Capability, MessageType
 from packages.protocol.exceptions import ProtocolError
@@ -198,7 +199,7 @@ class Session:
         self._peer = peer
         self._ui = ui
         self.transfers = TransferManager(
-            peer, download_dir, on_update=ui.transfer_update, on_stall=on_stall
+            peer, download_dir, on_update=self._on_transfer, on_stall=on_stall
         )
         #: Resolved with the peer's capabilities when its hello arrives.
         self.peer_hello: asyncio.Future[set[Capability]] = (
@@ -215,6 +216,11 @@ class Session:
 
     def start(self) -> None:
         self._send(MessageType.HELLO, HelloPayload(capabilities=CAPABILITIES))
+
+    def _on_transfer(self, transfer: Transfer) -> None:
+        self._ui.transfer_update(transfer)
+        if transfer.status.finished:  # reported exactly once, when it ends
+            history.record(transfer)
 
     def attach(self, peer: WebRTCPeer) -> None:
         """Continue on a new connection after a reconnect."""

@@ -135,6 +135,8 @@ class Transfer:
     #: Failed because the connection was lost or stalled, not because of
     #: the data: worth retrying once reconnected (resume makes it cheap).
     interrupted: bool = False
+    #: SHA-256 of the whole file, once the receiver has verified it.
+    sha256: str = ""
 
     _done: asyncio.Future[None] = field(
         default_factory=lambda: asyncio.get_running_loop().create_future(), repr=False
@@ -465,6 +467,7 @@ class TransferManager:
         if transfer.direction is Direction.SEND:
             # The receiver's confirmation: verified and saved
             transfer.bytes_acked = transfer.size
+            transfer.sha256 = payload.sha256.lower()
             self._finish(transfer, TransferStatus.COMPLETED, notify=False)
             return
 
@@ -488,6 +491,7 @@ class TransferManager:
             self._fail(transfer, f"cannot save file: {exc}")
             return
         transfer.path = final
+        transfer.sha256 = payload.sha256.lower()
 
         self._send(MessageType.TRANSFER_COMPLETE, payload)
         self._finish(transfer, TransferStatus.COMPLETED, notify=False)
