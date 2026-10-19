@@ -10,6 +10,7 @@ const phaseText: Record<Phase, string> = {
   waiting: "Waiting for the other person to join…",
   connecting: "Connecting directly…",
   connected: "Connected peer-to-peer",
+  reconnecting: "Connection lost — reconnecting…",
   closed: "The other person left",
   error: "Couldn't connect",
 };

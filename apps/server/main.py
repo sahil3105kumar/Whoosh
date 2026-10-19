@@ -49,6 +49,9 @@ room_create_limiter = RateLimiter(settings.room_create_per_minute)
 async def _sweep_expired_rooms() -> None:
     while True:
         await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)
+        # Occupied rooms never expire (D51); only abandoned ones do
+        for room_id in connection_manager.active_rooms():
+            room_manager.touch(room_id)
         evicted = room_manager.evict_expired()
         room_create_limiter.prune()
         if evicted:

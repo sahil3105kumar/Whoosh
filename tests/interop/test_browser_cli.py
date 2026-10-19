@@ -336,7 +336,11 @@ async def test_browser_to_cli_resumes_after_page_closes(
     try:
         await drop_file(page, "big.bin", size, seed=3)
         await wait_progress(page, 20)
-        await page.close()  # the connection drops mid-transfer
+        # Close the tab mid-transfer. Playwright skips unload handlers, so
+        # fire pagehide as a real browser would: the page says bye
+        await page.evaluate("dispatchEvent(new PageTransitionEvent('pagehide'))")
+        await asyncio.sleep(0.3)  # a real tab takes this long to tear down anyway
+        await page.close()
         assert await cli.exit_code() == 1, cli.output()
         assert list((tmp_path / ".whoosh-partial").glob("*.part")), "partial was not kept"
     finally:
@@ -370,7 +374,9 @@ async def test_cli_to_browser_resumes_after_cli_is_killed(
         await page.goto(f"{server}/#{room}")
         await wait_progress(page, 20)
         cli.proc.kill()  # the sender vanishes mid-transfer
-        await page.get_by_text("The other person left").wait_for(timeout=TIMEOUT_S * 1000)
+        # No bye arrived, so the browser assumes a network problem and tries
+        # to get the connection back (#19)
+        await page.get_by_text("reconnecting").wait_for(timeout=TIMEOUT_S * 1000)
     finally:
         await cli.close()
 
@@ -384,5 +390,73 @@ async def test_cli_to_browser_resumes_after_cli_is_killed(
         assert await cli.exit_code() == 0, cli.output()
         assert "resuming from" in cli.output()
         assert await page.get_by_text("resumed from").count() >= 1
+    finally:
+        await cli.close()
+
+
+# ── Automatic reconnection (#19) ────────────────────────────────────
+
+#: Keeps every RTCPeerConnection the page creates, so a test can cut one.
+CAPTURE_PCS = """
+window.__pcs = [];
+const Original = RTCPeerConnection;
+window.RTCPeerConnection = function (...args) {
+  const pc = new Original(...args);
+  window.__pcs.push(pc);
+  return pc;
+};
+window.RTCPeerConnection.prototype = Original.prototype;
+"""
+
+
+async def cut_connection(page: Page) -> None:
+    """Kill the page's live peer-to-peer connection, as a network failure would."""
+    await page.evaluate("window.__pcs.at(-1).close()")
+
+
+async def test_cli_send_survives_a_dropped_connection(
+    server: str, browser: Browser, tmp_path: Path
+):
+    src = tmp_path / "big.bin"
+    src.write_bytes(os.urandom(120_000_000))
+    page = await browser.new_page()
+    await page.add_init_script(CAPTURE_PCS)
+
+    cli = await Cli.start(server, "send", str(src))
+    try:
+        room = (await cli.wait_for(r"Room created: ([0-9a-f]{8})"))[1]
+        await page.goto(f"{server}/#{room}")
+        await wait_progress(page, 20)
+        await cut_connection(page)
+
+        # Nobody does anything: both sides reconnect and the send resumes
+        digest = await received_sha256(page, src.name)
+        assert digest == hashlib.sha256(src.read_bytes()).hexdigest()
+        assert await cli.exit_code() == 0, cli.output()
+        assert "Reconnected" in cli.output()
+        assert "resuming from" in cli.output()
+    finally:
+        await cli.close()
+
+
+async def test_browser_send_survives_a_dropped_connection(
+    server: str, browser: Browser, tmp_path: Path
+):
+    size = 40_000_000
+    page = await browser.new_page()
+    await page.add_init_script(CAPTURE_PCS)
+    room = await create_room(page, server)
+    cli = await Cli.start(server, "receive", room, "--out", str(tmp_path))
+    try:
+        await drop_file(page, "big.bin", size, seed=5)
+        await wait_progress(page, 20)
+        await cut_connection(page)
+
+        await page.get_by_text("Delivered").wait_for(timeout=TIMEOUT_S * 1000)
+        await page.get_by_role("button", name="Leave").click()  # says bye
+        assert await cli.exit_code() == 0, cli.output()
+        assert "Reconnected" in cli.output()
+        assert "resuming from" in cli.output()
+        assert (tmp_path / "big.bin").read_bytes() == pattern_bytes(size, seed=5)
     finally:
         await cli.close()

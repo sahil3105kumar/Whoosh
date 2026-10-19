@@ -6,12 +6,14 @@ file transfer. Terminal output goes through ``Ui``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
@@ -19,6 +21,7 @@ from packages.protocol.codec import decode, encode
 from packages.protocol.enums import Capability, MessageType
 from packages.protocol.exceptions import ProtocolError
 from packages.protocol.models import (
+    ByePayload,
     ChatPayload,
     ErrorPayload,
     HelloPayload,
@@ -181,17 +184,66 @@ class Ui:
 
 
 class Session:
-    def __init__(self, peer: WebRTCPeer, download_dir: Path, ui: Ui) -> None:
+    """The protocol conversation with the other peer. Survives reconnects:
+    ``attach`` moves it onto each new connection (D50)."""
+
+    def __init__(
+        self,
+        peer: WebRTCPeer,
+        download_dir: Path,
+        ui: Ui,
+        *,
+        on_stall: Callable[[], None] | None = None,
+    ) -> None:
         self._peer = peer
         self._ui = ui
-        self.transfers = TransferManager(peer, download_dir, on_update=ui.transfer_update)
+        self.transfers = TransferManager(
+            peer, download_dir, on_update=ui.transfer_update, on_stall=on_stall
+        )
         #: Resolved with the peer's capabilities when its hello arrives.
         self.peer_hello: asyncio.Future[set[Capability]] = (
             asyncio.get_running_loop().create_future()
         )
+        #: Set while attached to a live connection.
+        self.connected = asyncio.Event()
+        self.connected.set()
+        #: The other side said bye: it left on purpose, don't reconnect.
+        self.peer_left = False
+        #: Bumped on every reconnect, so waiters can tell a new connection
+        #: from the one that just failed.
+        self.generation = 0
 
     def start(self) -> None:
         self._send(MessageType.HELLO, HelloPayload(capabilities=CAPABILITIES))
+
+    def attach(self, peer: WebRTCPeer) -> None:
+        """Continue on a new connection after a reconnect."""
+        self._peer = peer
+        self.transfers.attach(peer)
+        self.peer_hello = asyncio.get_running_loop().create_future()
+        self.generation += 1
+        self.connected.set()
+        self.start()
+
+    async def wait_ready(self, *, after: int, timeout: float) -> bool:
+        """Wait for a connection newer than generation ``after`` whose hello
+        has arrived. ``after=-1`` accepts the current one."""
+
+        async def ready() -> None:
+            while self.generation <= after or not self.connected.is_set():
+                await asyncio.sleep(0.05)
+            await asyncio.shield(self.peer_hello)
+
+        try:
+            await asyncio.wait_for(ready(), timeout)
+        except TimeoutError:
+            return False
+        return True
+
+    def say_bye(self) -> None:
+        """Tell the other side we're leaving on purpose."""
+        with contextlib.suppress(ConnectionError):
+            self._send(MessageType.BYE, ByePayload())
 
     async def run_inbound(self) -> None:
         """Process incoming messages until the channel closes."""
@@ -211,6 +263,7 @@ class Session:
             log.debug("recv %s", msg.type)
             await self._dispatch(msg)
 
+        self.connected.clear()
         self.transfers.close("connection closed")
 
     async def _dispatch(self, msg: ProtocolMessage) -> None:
@@ -227,6 +280,8 @@ class Session:
         elif isinstance(payload, PongPayload):
             rtt_ms = (time.monotonic() - payload.timestamp) * 1000
             self._ui.hint(f"pong: {rtt_ms:.1f} ms round trip")
+        elif isinstance(payload, ByePayload):
+            self.peer_left = True
         elif isinstance(payload, ErrorPayload):
             # Never answer an error with an error — that's how loops start
             self._ui.error(f"peer reported an error: {payload.code}: {payload.message}")

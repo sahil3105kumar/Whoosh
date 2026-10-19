@@ -42,6 +42,10 @@ export class PeerChannel implements Channel {
   private lowWaiters: (() => void)[] = [];
   private closeListeners: (() => void)[] = [];
   private closed = false;
+
+  get isClosed(): boolean {
+    return this.closed;
+  }
   private disconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
@@ -114,131 +118,278 @@ export class PeerChannel implements Channel {
 
 // ── Connect ─────────────────────────────────────────────────────────
 
-export interface Connection {
-  channel: PeerChannel;
-  /** The signaling socket stays open for peer_left notices; P2P doesn't need it. */
-  ws: WebSocket;
+/** How long reconnect() keeps trying after the connection drops. */
+const RECONNECT_TIMEOUT_MS = 60_000;
+/** WebSocket close code the server uses for "room not found / expired / full". */
+const POLICY_VIOLATION = 1008;
+
+/** Turn the server's WebSocket close reason into advice for a person. */
+export function explainClose(reason: string, roomId: string): string {
+  if (reason.startsWith("No such room")) {
+    return `Room ${roomId} doesn't exist. Check the code; rooms also expire 10 minutes after they're created.`;
+  }
+  if (reason.startsWith("Room expired")) return `Room ${roomId} has expired. Ask for a new code.`;
+  if (reason.startsWith("Room is full")) return `Room ${roomId} already has two people in it.`;
+  return reason;
+}
+
+interface Signal {
+  type?: string;
+  sdp?: string;
+  reason?: string;
+  peer_id?: string;
 }
 
 /**
- * Join `roomId` and resolve once the DataChannel is open.
+ * A room's connection to the other peer, re-established when it drops
+ * (#19, docs/decisions.md D50) — the browser side of apps/cli/connection.py.
  *
- * Waits indefinitely for the other peer, then allows CONNECT_TIMEOUT_MS.
+ * Owns the signaling WebSocket (reconnecting with its peer_id so it keeps
+ * its slot) and the current RTCPeerConnection. When the peer-to-peer
+ * connection dies, the room creator re-offers as soon as both sides are
+ * reachable through signaling; the joiner accepts any new offer.
+ *
  * SDP is sent once ICE gathering completes, with candidates inline — no
- * trickle ICE, because the Python client (aiortc) neither sends nor
- * accepts trickled candidates (docs/decisions.md D35).
+ * trickle ICE, because the Python client (aiortc) neither sends nor accepts
+ * trickled candidates (D35).
  */
-export async function connect(
-  roomId: string,
-  isCreator: boolean,
-  onPhase: (phase: ConnectPhase) => void,
-  signal: AbortSignal,
-): Promise<Connection> {
-  const iceServers = await fetchIceServers();
-  // Bail before opening the socket: a cancelled attempt that reached the
-  // server would hold a room slot (React StrictMode runs effects twice).
-  if (signal.aborted) throw new ConnectError("Cancelled.");
-  const scheme = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${scheme}://${location.host}/rooms/${encodeURIComponent(roomId)}/ws`);
-  const pc = new RTCPeerConnection({ iceServers });
+export class Link {
+  private iceServers: RTCIceServer[] = [];
+  private ws?: WebSocket;
+  private peerId?: string;
+  private pc?: RTCPeerConnection;
+  private ready?: PeerChannel;
+  private otherSeen = false;
+  private negotiationStarted?: number;
+  private lastIceFailed = false;
+  private fatal?: ConnectError;
+  private closing = false;
+  private backoffMs = 500;
+  private waiters: (() => void)[] = [];
 
-  return new Promise<Connection>((resolve, reject) => {
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+  constructor(
+    readonly roomId: string,
+    readonly isCreator: boolean,
+    private readonly onPhase: (phase: ConnectPhase) => void,
+  ) {}
 
-    const fail = (message: string) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      ws.close();
-      pc.close();
-      reject(new ConnectError(message));
-    };
+  /** First connection: waits indefinitely for the other person, then
+   * CONNECT_TIMEOUT_MS for the connection itself. */
+  async open(signal: AbortSignal): Promise<PeerChannel> {
+    this.iceServers = await fetchIceServers();
+    // Bail before opening the socket: a cancelled attempt that reached the
+    // server would hold a room slot (React StrictMode runs effects twice).
+    if (signal.aborted) throw new ConnectError("Cancelled.");
+    signal.addEventListener("abort", () => this.close());
+    this.onPhase("signaling");
+    this.connectSignaling();
+    return this.waitReady(true);
+  }
 
-    signal.addEventListener("abort", () => fail("Cancelled."));
+  /** After the connection closed: wait for a new one. */
+  reconnect(timeoutMs = RECONNECT_TIMEOUT_MS): Promise<PeerChannel> {
+    if (this.isCreator) setTimeout(() => this.renegotiate(), 1000);
+    return this.waitReady(false, timeoutMs);
+  }
 
-    const onChannel = (dc: RTCDataChannel) => {
-      const open = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve({ channel: new PeerChannel(dc, pc), ws });
-      };
-      if (dc.readyState === "open") open();
-      else dc.addEventListener("open", open);
-    };
+  /** Abandon the current connection (it stalled), so a new one is made. */
+  drop(): void {
+    this.ready?.close();
+    this.pc?.close();
+  }
 
-    const startNegotiation = () => {
-      if (timer !== undefined) return;
-      onPhase("connecting");
-      timer = setTimeout(() => {
-        fail(
-          pc.iceConnectionState === "failed"
-            ? directFailedMessage
-            : "Timed out establishing the connection.",
-        );
-      }, CONNECT_TIMEOUT_MS);
-    };
+  close(): void {
+    this.closing = true;
+    this.drop();
+    this.ws?.close();
+    this.pulse();
+  }
 
-    pc.addEventListener("iceconnectionstatechange", () => {
-      if (pc.iceConnectionState === "failed") fail(directFailedMessage);
-    });
-    pc.addEventListener("datachannel", (event) => onChannel(event.channel));
+  // ── Waiting ───────────────────────────────────────────────────────
 
-    const sendDescription = async (description: RTCSessionDescriptionInit) => {
-      await pc.setLocalDescription(description);
-      await iceGatheringComplete(pc);
-      const local = pc.localDescription!;
-      ws.send(JSON.stringify({ type: local.type, sdp: local.sdp }));
-    };
+  private pulse(): void {
+    const waiters = this.waiters;
+    this.waiters = [];
+    for (const wake of waiters) wake();
+  }
 
-    const onSignal = async (msg: { type?: string; sdp?: string; reason?: string }) => {
-      switch (msg.type) {
-        case "hello":
-          onPhase("waiting");
-          break;
-        case "peer_joined":
-          if (isCreator) {
-            startNegotiation();
-            onChannel(pc.createDataChannel("whoosh"));
-            await sendDescription(await pc.createOffer());
-          }
-          break;
-        case "offer":
-          startNegotiation();
-          await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
-          await sendDescription(await pc.createAnswer());
-          break;
-        case "answer":
-          await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
-          break;
-        case "error":
-          console.error("signaling server:", msg.reason);
-          break;
+  private async waitReady(first: boolean, timeoutMs?: number): Promise<PeerChannel> {
+    let deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+    for (;;) {
+      if (this.ready && !this.ready.isClosed) return this.ready;
+      if (this.fatal) throw this.fatal;
+      if (this.closing) throw new ConnectError("Cancelled.");
+      if (first && deadline === undefined && this.negotiationStarted !== undefined) {
+        deadline = this.negotiationStarted + CONNECT_TIMEOUT_MS;
       }
-    };
+      const remaining = deadline === undefined ? undefined : deadline - Date.now();
+      if (remaining !== undefined && remaining <= 0) {
+        if (this.lastIceFailed) throw new ConnectError(directFailedMessage);
+        throw new ConnectError(
+          first ? "Timed out establishing the connection." : "Couldn't reconnect to the other person.",
+        );
+      }
+      await new Promise<void>((resolve) => {
+        this.waiters.push(resolve);
+        if (remaining !== undefined) setTimeout(resolve, remaining);
+      });
+    }
+  }
 
-    onPhase("signaling");
+  // ── Signaling ─────────────────────────────────────────────────────
+
+  private connectSignaling(): void {
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    const query = this.peerId ? `?peer_id=${encodeURIComponent(this.peerId)}` : "";
+    const ws = new WebSocket(
+      `${scheme}://${location.host}/rooms/${encodeURIComponent(this.roomId)}/ws${query}`,
+    );
+    this.ws = ws;
     ws.addEventListener("message", (event) => {
-      let msg: unknown;
+      let msg: Signal;
       try {
-        msg = JSON.parse(event.data as string);
+        msg = JSON.parse(event.data as string) as Signal;
       } catch {
         return;
       }
-      onSignal(msg as Parameters<typeof onSignal>[0]).catch((err: unknown) =>
-        fail(`WebRTC negotiation failed: ${(err as Error).message}`),
+      this.onSignal(msg).catch((err: unknown) =>
+        console.error("WebRTC negotiation failed", err),
       );
     });
     ws.addEventListener("close", (event) => {
-      const why = event.reason ? `: ${event.reason}` : ".";
-      fail(
-        timer === undefined
-          ? `Signaling closed before a peer arrived${why}`
-          : `Signaling closed before the connection opened${why}`,
-      );
+      if (this.ws === ws) this.ws = undefined;
+      if (this.closing) return;
+      if (event.code === POLICY_VIOLATION) {
+        // Room gone, expired or full: reconnecting can't help. A live P2P
+        // connection is unaffected; it just can't be re-made.
+        this.setFatal(explainClose(event.reason, this.roomId));
+        return;
+      }
+      if (this.peerId === undefined && !this.ready) {
+        this.setFatal("Can't reach the signaling server.");
+        return;
+      }
+      setTimeout(() => this.connectSignaling(), this.backoffMs);
+      this.backoffMs = Math.min(this.backoffMs * 2, 10_000);
     });
-  });
+  }
+
+  private setFatal(message: string): void {
+    this.fatal = new ConnectError(message);
+    this.pulse();
+  }
+
+  private sendSignal(msg: object): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) throw new Error("signaling is down");
+    this.ws.send(JSON.stringify(msg));
+  }
+
+  private async onSignal(msg: Signal): Promise<void> {
+    switch (msg.type) {
+      case "hello":
+        this.peerId = msg.peer_id;
+        this.backoffMs = 500;
+        if (!this.ready) this.onPhase(this.negotiationStarted ? "connecting" : "waiting");
+        // Back on signaling with the P2P link down: try again now
+        if (this.isCreator && this.otherSeen && !this.connected()) await this.negotiate();
+        break;
+      case "peer_joined":
+        this.otherSeen = true;
+        if (this.isCreator && !this.connected()) await this.negotiate();
+        break;
+      case "offer":
+        if (!this.isCreator) await this.acceptOffer(msg.sdp);
+        break;
+      case "answer":
+        if (this.isCreator && this.pc) await this.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+        break;
+      case "error":
+        console.error("signaling server:", msg.reason);
+        break;
+    }
+  }
+
+  // ── WebRTC ────────────────────────────────────────────────────────
+
+  private connected(): boolean {
+    return this.ready !== undefined && !this.ready.isClosed;
+  }
+
+  /** Replace the current connection with a fresh one. */
+  private newPeer(): RTCPeerConnection {
+    this.pc?.close();
+    this.ready = undefined;
+    this.lastIceFailed = false;
+    this.negotiationStarted = Date.now();
+    this.onPhase("connecting");
+    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    this.pc = pc;
+    this.pulse();
+    return pc;
+  }
+
+  private async negotiate(): Promise<void> {
+    if (this.closing || this.ws?.readyState !== WebSocket.OPEN) return; // retried on next hello
+    const pc = this.newPeer();
+    this.watch(pc, pc.createDataChannel("whoosh"));
+    await this.sendDescription(pc, await pc.createOffer());
+  }
+
+  private renegotiate(): void {
+    if (!this.closing && !this.connected()) void this.negotiate();
+  }
+
+  private async acceptOffer(sdp: string | undefined): Promise<void> {
+    const pc = this.newPeer();
+    pc.addEventListener("datachannel", (event) => this.watch(pc, event.channel));
+    await pc.setRemoteDescription({ type: "offer", sdp });
+    await this.sendDescription(pc, await pc.createAnswer());
+  }
+
+  private async sendDescription(
+    pc: RTCPeerConnection,
+    description: RTCSessionDescriptionInit,
+  ): Promise<void> {
+    await pc.setLocalDescription(description);
+    await iceGatheringComplete(pc);
+    if (pc !== this.pc) return; // superseded while gathering
+    const local = pc.localDescription!;
+    try {
+      this.sendSignal({ type: local.type, sdp: local.sdp });
+    } catch {
+      // signaling is down; the creator re-offers when it's back
+    }
+  }
+
+  /** Track one connection: publish its channel when open, notice when it ends. */
+  private watch(pc: RTCPeerConnection, dc: RTCDataChannel): void {
+    const timer = setTimeout(() => {
+      if (pc !== this.pc || this.connected()) return;
+      this.lastIceFailed = pc.iceConnectionState === "failed";
+      pc.close();
+      this.pulse();
+      if (this.isCreator && !this.closing) setTimeout(() => this.renegotiate(), 2000);
+    }, CONNECT_TIMEOUT_MS);
+
+    const open = () => {
+      clearTimeout(timer);
+      if (pc !== this.pc) {
+        pc.close(); // superseded while connecting
+        return;
+      }
+      const channel = new PeerChannel(dc, pc);
+      this.ready = channel;
+      this.pulse();
+      channel.onClose(() => {
+        if (this.ready === channel) {
+          this.ready = undefined;
+          this.pulse();
+        }
+      });
+    };
+    if (dc.readyState === "open") open();
+    else dc.addEventListener("open", open);
+  }
 }
 
 const directFailedMessage =

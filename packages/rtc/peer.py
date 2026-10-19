@@ -44,6 +44,7 @@ class WebRTCPeer:
         self._inbox: asyncio.Queue[str | bytes | None] = asyncio.Queue()
         self._buffer_low = asyncio.Event()
         self._closed = False
+        self._closed_event = asyncio.Event()
 
         @self.pc.on("datachannel")
         def on_datachannel(ch: RTCDataChannel) -> None:
@@ -100,6 +101,10 @@ class WebRTCPeer:
     def closed(self) -> bool:
         return self._closed
 
+    async def wait_closed(self) -> None:
+        """Wait until the channel ends, by whatever path."""
+        await self._closed_event.wait()
+
     def send(self, data: str | bytes) -> None:
         """Send one message. Raises ConnectionError if the channel isn't open."""
         if self._closed or self.channel is None or self.channel.readyState != "open":
@@ -155,6 +160,7 @@ class WebRTCPeer:
         if self._closed:
             return
         self._closed = True
+        self._closed_event.set()
         self._inbox.put_nowait(None)
         self._buffer_low.set()  # wake drain() so it sees the closed state
 

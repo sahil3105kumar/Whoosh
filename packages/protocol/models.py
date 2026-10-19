@@ -106,6 +106,11 @@ class PongPayload(Payload):
     timestamp: float
 
 
+class ByePayload(Payload):
+    """Sent just before leaving on purpose, so the other side ends the
+    session instead of trying to reconnect (docs/decisions.md D50)."""
+
+
 # ---------------------------------------------------------------------------
 # Discriminated union of all payload types
 # ---------------------------------------------------------------------------
@@ -120,7 +125,8 @@ AnyPayload = Annotated[
     | TransferAckPayload
     | ErrorPayload
     | PingPayload
-    | PongPayload,
+    | PongPayload
+    | ByePayload,
     Field(discriminator=None),
 ]
 

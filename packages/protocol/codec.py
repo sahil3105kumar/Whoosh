@@ -19,6 +19,7 @@ from packages.protocol.exceptions import (
     UnsupportedVersionError,
 )
 from packages.protocol.models import (
+    ByePayload,
     ChatPayload,
     ErrorPayload,
     FileMetadataPayload,
@@ -45,6 +46,7 @@ PAYLOAD_REGISTRY: dict[MessageType, type[Payload]] = {
     MessageType.ERROR: ErrorPayload,
     MessageType.PING: PingPayload,
     MessageType.PONG: PongPayload,
+    MessageType.BYE: ByePayload,
 }
 
 

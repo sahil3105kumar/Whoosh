@@ -202,3 +202,12 @@ async def test_relay_skips_dead_socket(manager):
     await cm.connect(room.id, dead)
 
     await cm.relay(room.id, pid_a, {"type": "offer", "sdp": "..."})  # should not raise
+
+
+async def test_active_rooms_lists_rooms_with_sockets(manager):
+    rm, cm = manager
+    occupied = rm.create_room()
+    rm.create_room()  # empty
+    await cm.connect(occupied.id, _make_ws())
+
+    assert cm.active_rooms() == [occupied.id]

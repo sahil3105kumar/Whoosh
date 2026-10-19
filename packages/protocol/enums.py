@@ -27,6 +27,7 @@ class MessageType(StrEnum):
     ERROR = "error"
     PING = "ping"
     PONG = "pong"
+    BYE = "bye"
 
 
 class Capability(StrEnum):

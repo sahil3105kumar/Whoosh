@@ -101,6 +101,15 @@ Acks outside `[last ack, bytes sent]` are ignored.
 couldn't be decoded (`bad_message`, `bad_frame`). Never answered with
 another error.
 
+### bye
+
+`{}` — sent just before leaving on purpose (quit, Leave, tab closed, a
+one-shot send finished). The receiver ends the session. Without a `bye`,
+a closed connection is treated as a network failure and both sides try
+to reconnect (see [Reconnection](#reconnection)). Best-effort: a closing
+browser tab may not get it out in time, in which case the other side
+gives up after its reconnect window.
+
 ### ping / pong
 
 `{"timestamp": <float>}` — `pong` echoes the `ping`'s timestamp, so the
@@ -163,6 +172,22 @@ sender                                   receiver
 The sender hashes the skipped prefix locally, so the final SHA-256 still
 covers the whole file. Partial data is kept when the connection drops,
 and deleted on `transfer_cancel` or any integrity failure.
+
+## Reconnection
+
+When the peer-to-peer connection drops without a `bye` (lost network,
+crash, or a transfer stalling with no acks), both sides keep their slot
+in the room and reconnect:
+
+* A dropped signaling WebSocket reconnects with `?peer_id=` to reclaim
+  its slot.
+* The room creator sends a fresh offer whenever the connection is down
+  and both peers are on signaling (on its own reconnect, on
+  `peer_joined`, and shortly after a drop). The joiner accepts any new
+  offer, replacing its old connection.
+* On the new connection both sides send `hello` again. Interrupted
+  outgoing transfers are re-sent (up to 3 attempts per file) and resume
+  from the receiver's partial copy.
 
 ## Versioning
 

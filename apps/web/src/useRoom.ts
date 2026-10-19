@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { type ConnectPhase, connect } from "./lib/connection";
+import { type ConnectPhase, Link, type PeerChannel } from "./lib/connection";
 import { type QueuedFile, SendQueue } from "./lib/queue";
 import { Session } from "./lib/session";
 import type { Transfer } from "./lib/transfer";
 
-export type Phase = ConnectPhase | "connected" | "closed" | "error";
+export type Phase = ConnectPhase | "connected" | "reconnecting" | "closed" | "error";
 
 export interface LogEntry {
   id: number;
@@ -15,6 +15,10 @@ export interface LogEntry {
 
 /** How often to measure latency while connected (shown in the status bar). */
 const LATENCY_INTERVAL_MS = 10_000;
+/** Attempts per file when the connection keeps dropping (#19). */
+const MAX_SEND_ATTEMPTS = 3;
+/** How long a retry waits for the reconnect. */
+const RETRY_WAIT_MS = 90_000;
 
 let nextLogId = 0;
 
@@ -38,49 +42,84 @@ export function useRoom(roomId: string, isCreator: boolean) {
 
   useEffect(() => {
     const abort = new AbortController();
-    let session: Session | undefined;
-    let ws: WebSocket | undefined;
+    const link = new Link(roomId, isCreator, setPhase);
     let pinger: ReturnType<typeof setInterval> | undefined;
+    let alive = true;
 
+    const session = new Session(
+      {
+        onChat: (text) => addLog("peer", text),
+        onNotice: (text) => addLog("system", text),
+        onTransfer: (t) =>
+          setTransfers((list) => {
+            const i = list.findIndex((x) => x.id === t.id);
+            return i === -1 ? [...list, t] : list.with(i, t);
+          }),
+        onPeerReady: () => setPeerReady(true),
+        onLatency: (ms) => {
+          setLatencyMs(ms);
+          if (manualPing.current) {
+            manualPing.current = false;
+            addLog("system", `Round trip: ${ms.toFixed(1)} ms`);
+          }
+        },
+        onClosed: () => {
+          clearInterval(pinger);
+          setLatencyMs(undefined);
+          setPeerReady(false);
+          if (!alive) return;
+          if (session.peerLeft) {
+            const dropped = queue.clear().length;
+            if (dropped) addLog("system", `${dropped} queued file(s) weren't sent.`);
+            setPhase("closed");
+            return;
+          }
+          // Not a goodbye: the connection dropped. Get it back (D50)
+          setPhase("reconnecting");
+          link
+            .reconnect()
+            .then(attach)
+            .catch((err: unknown) => {
+              if (!alive) return;
+              queue.clear();
+              setError((err as Error).message);
+              setPhase("closed");
+            });
+        },
+      },
+      () => link.drop(), // a transfer stalled: the connection is dead
+    );
+    sessionRef.current = session;
+
+    // Interrupted sends are retried after reconnecting; resume means only
+    // the missing part goes again (#19)
     const queue = new SendQueue(async (file) => {
-      if (session) {
-        await session.transfers.sendFile(file, session.sendOptions());
+      for (let attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt++) {
+        const generation = session.generation;
+        const t = await session.transfers.sendFile(file, session.sendOptions());
+        if (!t.interrupted || attempt === MAX_SEND_ATTEMPTS) return;
+        if (!(await session.waitReady(generation, RETRY_WAIT_MS))) return;
       }
     }, setQueued);
     queueRef.current = queue;
 
-    connect(roomId, isCreator, setPhase, abort.signal)
-      .then((conn) => {
-        ws = conn.ws;
-        session = new Session(conn.channel, {
-          onChat: (text) => addLog("peer", text),
-          onNotice: (text) => addLog("system", text),
-          onTransfer: (t) =>
-            setTransfers((list) => {
-              const i = list.findIndex((x) => x.id === t.id);
-              return i === -1 ? [...list, t] : list.with(i, t);
-            }),
-          onPeerReady: () => setPeerReady(true),
-          onLatency: (ms) => {
-            setLatencyMs(ms);
-            if (manualPing.current) {
-              manualPing.current = false;
-              addLog("system", `Round trip: ${ms.toFixed(1)} ms`);
-            }
-          },
-          onClosed: () => {
-            clearInterval(pinger);
-            setLatencyMs(undefined);
-            const dropped = queue.clear().length;
-            if (dropped) addLog("system", `${dropped} queued file(s) weren't sent.`);
-            setPhase((p) => (p === "connected" ? "closed" : p));
-          },
-        });
-        sessionRef.current = session;
-        setPhase("connected");
-        session.ping();
-        pinger = setInterval(() => session?.ping(), LATENCY_INTERVAL_MS);
-      })
+    const attach = (channel: PeerChannel) => {
+      if (!alive) return;
+      session.attach(channel);
+      setError(undefined);
+      setPhase("connected");
+      session.ping();
+      clearInterval(pinger);
+      pinger = setInterval(() => session.ping(), LATENCY_INTERVAL_MS);
+    };
+
+    // Closing the tab is leaving on purpose, not a network failure
+    const onPageHide = () => session.sayBye();
+    addEventListener("pagehide", onPageHide);
+
+    link
+      .open(abort.signal)
+      .then(attach)
       .catch((err: unknown) => {
         if (abort.signal.aborted) return;
         setError((err as Error).message);
@@ -88,11 +127,17 @@ export function useRoom(roomId: string, isCreator: boolean) {
       });
 
     return () => {
+      alive = false;
+      removeEventListener("pagehide", onPageHide);
+      session.sayBye();
       abort.abort();
       clearInterval(pinger);
       queue.clear();
-      session?.close();
-      ws?.close();
+      // Give the bye a moment to leave before the connection closes
+      setTimeout(() => {
+        session.close();
+        link.close();
+      }, 100);
       sessionRef.current = undefined;
     };
   }, [roomId, isCreator, addLog]);

@@ -80,6 +80,9 @@ export interface Transfer {
   readonly bytesAcked: number;
   /** Whether the receiver acknowledges (sender side). */
   readonly acked: boolean;
+  /** Failed because the connection was lost or stalled, not because of the
+   * data: worth retrying once reconnected (resume makes it cheap). */
+  readonly interrupted: boolean;
   /** Object URL of the received file, once completed. */
   readonly url?: string;
 }
@@ -89,6 +92,7 @@ class TransferState {
   resumedFrom = 0;
   bytesAcked = 0;
   acked = false;
+  interrupted = false;
   /** Receiver: send transfer_ack? And bytes covered by the last one sent. */
   sendAcks = false;
   lastAckSent = 0;
@@ -130,7 +134,7 @@ class TransferState {
 
   snapshot(): Transfer {
     const { id, direction, filename, size, bytesDone, status, reason, startedAt, url } = this;
-    const { resumedFrom, bytesAcked, acked } = this;
+    const { resumedFrom, bytesAcked, acked, interrupted } = this;
     return {
       id,
       direction,
@@ -144,6 +148,7 @@ class TransferState {
       resumedFrom,
       bytesAcked,
       acked,
+      interrupted,
     };
   }
 }
@@ -156,6 +161,8 @@ export interface TransferOptions {
   reportIntervalMs?: number;
   /** Where interrupted receives are kept: the tab's store unless injected. */
   partials?: Map<string, Partial>;
+  /** A transfer stalled: the connection is dead even if it hasn't said so. */
+  onStall?: () => void;
 }
 
 export class TransferManager {
@@ -165,9 +172,10 @@ export class TransferManager {
   private readonly stallTimeoutMs: number;
   private readonly reportIntervalMs: number;
   private readonly partials: Map<string, Partial>;
+  private readonly onStall?: () => void;
 
   constructor(
-    private readonly channel: Channel,
+    private channel: Channel,
     private readonly onUpdate: (transfer: Transfer) => void = () => {},
     options: TransferOptions = {},
   ) {
@@ -176,6 +184,7 @@ export class TransferManager {
     this.stallTimeoutMs = options.stallTimeoutMs ?? STALL_TIMEOUT_MS;
     this.reportIntervalMs = options.reportIntervalMs ?? REPORT_INTERVAL_MS;
     this.partials = options.partials ?? tabPartials;
+    this.onStall = options.onStall;
   }
 
   // ── Sending ───────────────────────────────────────────────────────
@@ -220,7 +229,7 @@ export class TransferManager {
       }
     } catch (err) {
       if (err instanceof ConnectionClosedError) {
-        this.finish(st, "failed", "connection lost", false);
+        this.interrupt(st, "connection lost");
       } else {
         this.fail(st, `read error: ${(err as Error).message}`);
       }
@@ -289,7 +298,10 @@ export class TransferManager {
         });
       });
       if (outcome === "timeout") {
-        this.fail(st, `stalled: nothing acknowledged for ${this.stallTimeoutMs / 1000}s`);
+        // Nothing to tell the receiver (the path to it is what failed), and it
+        // must keep its partial for the retry
+        this.interrupt(st, `stalled: nothing acknowledged for ${this.stallTimeoutMs / 1000}s`);
+        this.onStall?.();
         return false;
       }
     }
@@ -447,7 +459,7 @@ export class TransferManager {
    * Resumable partials are kept. */
   close(reason = "connection closed"): void {
     for (const st of this.transfers.values()) {
-      if (!st.finished) this.finish(st, "failed", reason, false, true);
+      if (!st.finished) this.interrupt(st, reason);
     }
   }
 
@@ -476,6 +488,20 @@ export class TransferManager {
     const waiters = st.ackWaiters;
     st.ackWaiters = [];
     for (const wake of waiters) wake();
+  }
+
+  /** Use a new channel after a reconnect. Transfers on the old one have
+   * already ended (close()); they continue by being sent again. */
+  attach(channel: Channel): void {
+    this.channel = channel;
+  }
+
+  /** End a transfer because the connection failed: keep partial data and
+   * flag it for a retry. */
+  private interrupt(st: TransferState, reason: string): void {
+    if (st.finished) return;
+    st.interrupted = true;
+    this.finish(st, "failed", reason, false, true);
   }
 
   private fail(st: TransferState, reason: string): void {

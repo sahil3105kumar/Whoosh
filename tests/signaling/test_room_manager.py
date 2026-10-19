@@ -177,3 +177,16 @@ def test_evict_expired_removes_only_expired_rooms():
     assert manager.get_room(fresh.id) is fresh
     with pytest.raises(RoomNotFoundError):
         manager.get_room(stale.id)
+
+
+def test_touch_extends_expiry():
+    manager = RoomManager(ttl_seconds=60)
+    room = manager.create_room()
+    manager.touch(room.id, now=room.created_at + 50)
+
+    assert room.expires_at == room.created_at + 110
+    assert manager.evict_expired(now=room.created_at + 100) == 0
+
+
+def test_touch_unknown_room_is_noop():
+    RoomManager().touch("nope")

@@ -644,3 +644,35 @@ transfer as stalled. `transfer_ack` replaces the reserved, never-used
   costs almost nothing.
 - *Protocol change:* `progress` was never sent by anyone, so replacing
   it costs nothing before a release (D14).
+
+### D50. Retry means reconnect and resume; `bye` marks a deliberate exit
+*2026-10-19 — #19*
+
+**Decision** — Both clients survive a dropped connection: the signaling
+socket reconnects with its `peer_id`, the room creator re-offers, the
+joiner accepts any new offer, and the session moves onto the new
+connection. Interrupted outgoing transfers are retried automatically
+(3 attempts per file); with resume (D46) only the missing part is sent
+again. A stalled transfer (D49) tears the dead connection down to
+trigger this. A new `bye` message, sent on quit / Leave / tab close /
+end of a one-shot send, tells the other side not to bother reconnecting.
+**Why** — #19 asks to retry failed *chunks*. On a reliable, ordered
+DataChannel individual chunks never fail (SCTP retransmits them); what
+fails is the whole connection. Retrying at that level, with resume,
+recovers from the failures that actually happen without a second
+retransmission layer on top of SCTP.
+**Details** — Without `bye`, an intentional exit looks exactly like a
+crash, and the other side would spend a minute "reconnecting". `bye`
+from a closing browser tab is best-effort (sent on `pagehide`); when it
+doesn't make it, the other side gives up after the 60 s reconnect window.
+Verified by interop tests that cut the browser's connection mid-transfer
+in both directions.
+
+### D51. Occupied rooms don't expire
+*2026-10-19 — #19, revises D3*
+
+**Decision** — The periodic sweep extends the expiry of every room with
+a connected WebSocket by a full TTL. Only rooms nobody is connected to
+expire.
+**Why** — D3's expiry counted from creation, so a session older than 10
+minutes couldn't reconnect after a drop: the room would be gone.

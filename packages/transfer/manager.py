@@ -127,6 +127,9 @@ class Transfer:
     acked: bool = False
     status: TransferStatus = TransferStatus.STREAMING
     reason: str = ""
+    #: Failed because the connection was lost or stalled, not because of
+    #: the data: worth retrying once reconnected (resume makes it cheap).
+    interrupted: bool = False
 
     _done: asyncio.Future[None] = field(
         default_factory=lambda: asyncio.get_running_loop().create_future(), repr=False
@@ -156,6 +159,7 @@ class TransferManager:
         download_dir: Path,
         *,
         on_update: Callable[[Transfer], None] | None = None,
+        on_stall: Callable[[], None] | None = None,
         confirm_timeout: float = DEFAULT_CONFIRM_TIMEOUT,
         accept_timeout: float = DEFAULT_ACCEPT_TIMEOUT,
         stall_timeout: float = DEFAULT_STALL_TIMEOUT,
@@ -164,6 +168,7 @@ class TransferManager:
         self._download_dir = download_dir
         self._partials = PartialStore(download_dir)
         self._on_update = on_update
+        self._on_stall = on_stall
         self._confirm_timeout = confirm_timeout
         self._accept_timeout = accept_timeout
         self._stall_timeout = stall_timeout
@@ -174,6 +179,11 @@ class TransferManager:
     @property
     def transfers(self) -> list[Transfer]:
         return list(self._transfers.values())
+
+    def attach(self, channel: Channel) -> None:
+        """Use a new channel after a reconnect. Transfers on the old one
+        have already ended (``close``); they continue by being re-sent."""
+        self._channel = channel
 
     # ── Sending ─────────────────────────────────────────────────────
 
@@ -231,7 +241,7 @@ class TransferManager:
                     await asyncio.wait_for(asyncio.shield(transfer._done), self._confirm_timeout)
             # ConnectionError and TimeoutError are OSError subclasses: order matters
             except ConnectionError:
-                self._finish(transfer, TransferStatus.FAILED, "connection lost", notify=False)
+                self._interrupt(transfer, "connection lost")
             except TimeoutError:
                 self._fail(transfer, "receiver did not confirm the file")
             except OSError as exc:
@@ -295,8 +305,12 @@ class TransferManager:
             try:
                 await asyncio.wait_for(transfer._ack_event.wait(), self._stall_timeout)
             except TimeoutError:
+                # Nothing to tell the receiver (the path to it is what failed),
+                # and it must keep its partial for the retry
                 quiet = f"{self._stall_timeout:.0f}s"
-                self._fail(transfer, f"stalled: nothing acknowledged for {quiet}")
+                self._interrupt(transfer, f"stalled: nothing acknowledged for {quiet}")
+                if self._on_stall is not None:
+                    self._on_stall()
                 return False
         return not transfer.status.finished
 
@@ -486,9 +500,7 @@ class TransferManager:
         when the channel is gone. Resumable partials are kept."""
         for transfer in list(self._transfers.values()):
             if not transfer.status.finished:
-                self._finish(
-                    transfer, TransferStatus.FAILED, reason, notify=False, keep_partial=True
-                )
+                self._interrupt(transfer, reason)
 
     # ── Internals ───────────────────────────────────────────────────
 
@@ -515,6 +527,14 @@ class TransferManager:
                 MessageType.TRANSFER_ACK,
                 TransferAckPayload(transfer_id=transfer.id, offset=transfer.bytes_done),
             )
+
+    def _interrupt(self, transfer: Transfer, reason: str) -> None:
+        """End a transfer because the connection failed: keep partial data
+        and flag it for a retry."""
+        if transfer.status.finished:
+            return
+        transfer.interrupted = True
+        self._finish(transfer, TransferStatus.FAILED, reason, notify=False, keep_partial=True)
 
     def _fail(self, transfer: Transfer, reason: str) -> None:
         self._finish(transfer, TransferStatus.FAILED, reason, notify=True)

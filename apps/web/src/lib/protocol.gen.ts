@@ -2,7 +2,7 @@
 
 export const PROTOCOL_VERSION = 1;
 
-export type MessageType = "hello" | "chat" | "file_metadata" | "transfer_complete" | "transfer_cancel" | "transfer_accept" | "transfer_ack" | "error" | "ping" | "pong";
+export type MessageType = "hello" | "chat" | "file_metadata" | "transfer_complete" | "transfer_cancel" | "transfer_accept" | "transfer_ack" | "error" | "ping" | "pong" | "bye";
 
 export type Capability = "chat" | "file_transfer" | "cancel" | "resume" | "ack";
 
@@ -66,6 +66,10 @@ export interface PongPayload {
   timestamp: number;
 }
 
+/** Sent just before leaving on purpose, so the other side ends the session instead of trying to reconnect (docs/decisions.md D50). */
+export interface ByePayload {
+}
+
 export interface MessageMap {
   hello: HelloPayload;
   chat: ChatPayload;
@@ -77,6 +81,7 @@ export interface MessageMap {
   error: ErrorPayload;
   ping: PingPayload;
   pong: PongPayload;
+  bye: ByePayload;
 }
 
 export type FieldKind = "string" | "integer" | "number" | "boolean" | "string[]";
@@ -126,5 +131,7 @@ export const PAYLOAD_FIELDS: Record<MessageType, Record<string, FieldSpec>> = {
   },
   pong: {
     timestamp: { kind: "number", optional: false, nullable: false },
+  },
+  bye: {
   },
 };

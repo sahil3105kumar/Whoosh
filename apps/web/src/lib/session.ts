@@ -13,7 +13,7 @@ import {
   decodeMessage,
   encodeMessage,
 } from "./protocol";
-import { type Transfer, TransferManager } from "./transfer";
+import { type Channel, ConnectionClosedError, type Transfer, TransferManager } from "./transfer";
 
 export const CAPABILITIES: Capability[] = ["chat", "file_transfer", "cancel", "resume", "ack"];
 
@@ -27,27 +27,85 @@ export interface SessionEvents {
   onClosed(): void;
 }
 
+/** Stands in before the first connection: every send fails as closed. */
+const notConnected: Channel = {
+  send() {
+    throw new ConnectionClosedError();
+  },
+  async drain() {
+    throw new ConnectionClosedError();
+  },
+};
+
+/**
+ * The protocol conversation with the other peer. Survives reconnects:
+ * attach() moves it onto each new connection (docs/decisions.md D50).
+ */
 export class Session {
   readonly transfers: TransferManager;
+  private channel?: PeerChannel;
   private peerCapabilities: Set<Capability> | undefined;
+  /** Bumped on every attach, so waiters can tell a new connection from the
+   * one that just failed. */
+  generation = 0;
+  /** The other side said bye: it left on purpose, don't reconnect. */
+  peerLeft = false;
+  private readyWaiters: (() => void)[] = [];
 
   constructor(
-    private readonly channel: PeerChannel,
     private readonly events: SessionEvents,
+    onStall?: () => void,
   ) {
-    this.transfers = new TransferManager(channel, events.onTransfer);
+    this.transfers = new TransferManager(notConnected, events.onTransfer, { onStall });
+  }
+
+  /** Continue on a (new) connection. */
+  attach(channel: PeerChannel): void {
+    this.channel = channel;
+    this.peerCapabilities = undefined;
+    this.generation++;
+    this.transfers.attach(channel);
 
     // DataChannel events are delivered one at a time, in order, and every
     // handler below is synchronous, so messages are processed in order
     // (the property packages/rtc needed a queue for — docs/decisions.md D24).
-    channel.dc.addEventListener("message", (event: MessageEvent<string | ArrayBuffer>) =>
-      this.onMessage(event.data),
-    );
+    channel.dc.addEventListener("message", (event: MessageEvent<string | ArrayBuffer>) => {
+      if (this.channel === channel) this.onMessage(event.data);
+    });
     channel.onClose(() => {
+      if (this.channel !== channel) return;
       this.transfers.close("connection closed");
-      events.onClosed();
+      this.events.onClosed();
     });
     this.send("hello", { capabilities: CAPABILITIES });
+  }
+
+  get connected(): boolean {
+    return this.channel !== undefined && !this.channel.isClosed;
+  }
+
+  /** Wait for a connection newer than generation `after` whose hello has
+   * arrived; false on timeout. */
+  async waitReady(after: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (!(this.generation > after && this.connected && this.peerCapabilities)) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      await new Promise<void>((resolve) => {
+        this.readyWaiters.push(resolve);
+        setTimeout(resolve, Math.min(remaining, 500));
+      });
+    }
+    return true;
+  }
+
+  /** Tell the other side we're leaving on purpose. */
+  sayBye(): void {
+    try {
+      this.send("bye", {});
+    } catch {
+      // already disconnected
+    }
   }
 
   canSendFiles(): boolean {
@@ -74,7 +132,7 @@ export class Session {
 
   close(): void {
     this.transfers.dispose();
-    this.channel.close();
+    this.channel?.close();
   }
 
   private onMessage(data: string | ArrayBuffer): void {
@@ -106,6 +164,7 @@ export class Session {
         if (!this.peerCapabilities) {
           this.peerCapabilities = new Set(msg.payload.capabilities);
           this.events.onPeerReady(msg.payload.capabilities);
+          for (const wake of this.readyWaiters.splice(0)) wake();
         }
         break;
       case "chat":
@@ -117,6 +176,9 @@ export class Session {
       case "pong":
         this.events.onLatency(performance.now() - msg.payload.timestamp);
         break;
+      case "bye":
+        this.peerLeft = true;
+        break;
       case "error":
         // Never answer an error with an error — that's how loops start
         this.events.onNotice(`Peer reported an error: ${msg.payload.message}`);
@@ -125,6 +187,7 @@ export class Session {
   }
 
   private send<K extends MessageType>(type: K, payload: MessageMap[K]): void {
+    if (!this.channel) throw new ConnectionClosedError();
     this.channel.send(encodeMessage(type, payload));
   }
 
