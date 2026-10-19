@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { type ConnectPhase, connect } from "./lib/connection";
+import { type QueuedFile, SendQueue } from "./lib/queue";
 import { Session } from "./lib/session";
 import type { Transfer } from "./lib/transfer";
 
@@ -12,6 +13,9 @@ export interface LogEntry {
   text: string;
 }
 
+/** How often to measure latency while connected (shown in the status bar). */
+const LATENCY_INTERVAL_MS = 10_000;
+
 let nextLogId = 0;
 
 /** Connection + session lifecycle for one room, as React state. */
@@ -20,8 +24,13 @@ export function useRoom(roomId: string, isCreator: boolean) {
   const [error, setError] = useState<string>();
   const [log, setLog] = useState<LogEntry[]>([]);
   const [transfers, setTransfers] = useState<Transfer[]>([]);
+  const [queued, setQueued] = useState<readonly QueuedFile[]>([]);
   const [peerReady, setPeerReady] = useState(false);
+  const [latencyMs, setLatencyMs] = useState<number>();
   const sessionRef = useRef<Session>(undefined);
+  const queueRef = useRef<SendQueue>(undefined);
+  // A Ping button press reports its result in the chat; background pings don't
+  const manualPing = useRef(false);
 
   const addLog = useCallback((from: LogEntry["from"], text: string) => {
     setLog((entries) => [...entries, { id: nextLogId++, from, text }]);
@@ -31,6 +40,12 @@ export function useRoom(roomId: string, isCreator: boolean) {
     const abort = new AbortController();
     let session: Session | undefined;
     let ws: WebSocket | undefined;
+    let pinger: ReturnType<typeof setInterval> | undefined;
+
+    const queue = new SendQueue(async (file) => {
+      if (session) await session.transfers.sendFile(file);
+    }, setQueued);
+    queueRef.current = queue;
 
     connect(roomId, isCreator, setPhase, abort.signal)
       .then((conn) => {
@@ -44,10 +59,25 @@ export function useRoom(roomId: string, isCreator: boolean) {
               return i === -1 ? [...list, t] : list.with(i, t);
             }),
           onPeerReady: () => setPeerReady(true),
-          onClosed: () => setPhase((p) => (p === "connected" ? "closed" : p)),
+          onLatency: (ms) => {
+            setLatencyMs(ms);
+            if (manualPing.current) {
+              manualPing.current = false;
+              addLog("system", `Round trip: ${ms.toFixed(1)} ms`);
+            }
+          },
+          onClosed: () => {
+            clearInterval(pinger);
+            setLatencyMs(undefined);
+            const dropped = queue.clear().length;
+            if (dropped) addLog("system", `${dropped} queued file(s) weren't sent.`);
+            setPhase((p) => (p === "connected" ? "closed" : p));
+          },
         });
         sessionRef.current = session;
         setPhase("connected");
+        session.ping();
+        pinger = setInterval(() => session?.ping(), LATENCY_INTERVAL_MS);
       })
       .catch((err: unknown) => {
         if (abort.signal.aborted) return;
@@ -57,6 +87,8 @@ export function useRoom(roomId: string, isCreator: boolean) {
 
     return () => {
       abort.abort();
+      clearInterval(pinger);
+      queue.clear();
       session?.close();
       ws?.close();
       sessionRef.current = undefined;
@@ -71,17 +103,29 @@ export function useRoom(roomId: string, isCreator: boolean) {
     [addLog],
   );
 
-  const sendFiles = useCallback(async (files: File[]) => {
-    // One at a time: concurrent sends would just share the same channel
-    for (const file of files) {
-      const session = sessionRef.current;
-      if (!session) return;
-      await session.transfers.sendFile(file);
-    }
+  const sendFiles = useCallback((files: File[]) => queueRef.current?.add(files), []);
+  const unqueue = useCallback((id: string) => queueRef.current?.remove(id), []);
+  const cancel = useCallback((id: string) => sessionRef.current?.transfers.cancel(id), []);
+  const ping = useCallback(() => {
+    manualPing.current = true;
+    sessionRef.current?.ping();
   }, []);
 
-  const cancel = useCallback((id: string) => sessionRef.current?.transfers.cancel(id), []);
-  const ping = useCallback(() => sessionRef.current?.ping(), []);
+  const busy = queued.length > 0 || transfers.some((t) => t.status === "streaming");
 
-  return { phase, error, log, transfers, peerReady, sendChat, sendFiles, cancel, ping };
+  return {
+    phase,
+    error,
+    log,
+    transfers,
+    queued,
+    peerReady,
+    latencyMs,
+    busy,
+    sendChat,
+    sendFiles,
+    unqueue,
+    cancel,
+    ping,
+  };
 }

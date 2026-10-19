@@ -16,6 +16,12 @@ export function Home({
 
   const valid = /^[0-9a-f]{8}$/.test(code);
 
+  // Accept a pasted invite link as well as a bare code
+  const onCodeInput = (value: string) => {
+    const fromLink = /#([0-9a-f]{8})\s*$/i.exec(value);
+    setCode((fromLink ? fromLink[1]! : value).trim().toLowerCase());
+  };
+
   const create = async () => {
     setCreating(true);
     setError(undefined);
@@ -48,15 +54,14 @@ export function Home({
       <Card>
         <h2 className="text-lg font-medium">Join a room</h2>
         <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-          Enter the 8-character code you were given.
+          Enter the 8-character code, or paste the invite link.
         </p>
         <form className="mt-5 flex gap-2" onSubmit={join}>
           <input
             className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono tracking-widest outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-slate-700 dark:bg-slate-900"
             placeholder="a1b2c3d4"
             value={code}
-            onChange={(e) => setCode(e.target.value.trim().toLowerCase())}
-            maxLength={8}
+            onChange={(e) => onCodeInput(e.target.value)}
             autoComplete="off"
             spellCheck={false}
             aria-label="Room code"

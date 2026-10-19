@@ -1,5 +1,6 @@
-import { type DragEvent, type FormEvent, useEffect, useRef, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 
+import type { QueuedFile } from "../lib/queue";
 import type { Transfer } from "../lib/transfer";
 import { type LogEntry, type Phase, useRoom } from "../useRoom";
 import { Button, Card, formatBytes } from "./ui";
@@ -17,22 +18,46 @@ export function Room({
   roomId,
   isCreator,
   onLeave,
+  onRetry,
 }: {
   roomId: string;
   isCreator: boolean;
   onLeave: () => void;
+  onRetry: () => void;
 }) {
   const room = useRoom(roomId, isCreator);
   const live = room.phase === "connected";
+  const canSend = live && room.peerReady;
+  const dragging = usePageDrop(canSend, room.sendFiles);
+  useUnreadTitle(room.log);
+  useWarnBeforeUnload(room.busy);
+
+  const leave = () => {
+    if (!room.busy || confirm("Files are still being transferred. Leave anyway?")) onLeave();
+  };
 
   return (
     <div className="flex flex-col gap-4">
+      {dragging && (
+        <div className="pointer-events-none fixed inset-0 z-10 flex items-center justify-center bg-sky-500/15 backdrop-blur-[1px]">
+          <p className="rounded-xl bg-white px-6 py-4 text-lg font-medium shadow-lg dark:bg-slate-900">
+            Drop to send
+          </p>
+        </div>
+      )}
+
       <Card className="flex flex-wrap items-center gap-3">
         <StatusDot phase={room.phase} />
         <div className="min-w-0 flex-1">
           <p className="font-medium">{phaseText[room.phase]}</p>
           <p className="text-sm text-slate-500 dark:text-slate-400">
             Room <span className="font-mono">{roomId}</span>
+            {live && room.latencyMs !== undefined && (
+              <span title="Round-trip time to the other person">
+                {" "}
+                · {room.latencyMs < 1 ? "<1" : room.latencyMs.toFixed(0)} ms
+              </span>
+            )}
           </p>
         </div>
         {live && (
@@ -40,7 +65,8 @@ export function Room({
             Ping
           </Button>
         )}
-        <Button variant="secondary" onClick={onLeave}>
+        {room.phase === "error" && <Button onClick={onRetry}>Try again</Button>}
+        <Button variant="secondary" onClick={leave}>
           Leave
         </Button>
         {room.error && (
@@ -57,14 +83,96 @@ export function Room({
           <Chat log={room.log} onSend={room.sendChat} disabled={!live} />
           <Files
             transfers={room.transfers}
-            canSend={live && room.peerReady}
+            queued={room.queued}
+            canSend={canSend}
             onSend={room.sendFiles}
             onCancel={room.cancel}
+            onUnqueue={room.unqueue}
           />
         </div>
       )}
     </div>
   );
+}
+
+/** Accept files dropped anywhere on the page; returns whether a drag is over it. */
+function usePageDrop(enabled: boolean, onFiles: (files: File[]) => void): boolean {
+  const [dragging, setDragging] = useState(false);
+
+  useEffect(() => {
+    if (!enabled) return;
+    // dragenter/dragleave fire for every child element crossed; count them
+    let depth = 0;
+    const hasFiles = (e: DragEvent) => e.dataTransfer?.types.includes("Files") ?? false;
+    const enter = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      depth++;
+      setDragging(true);
+    };
+    const leave = () => {
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) setDragging(false);
+    };
+    const over = (e: DragEvent) => {
+      if (hasFiles(e)) e.preventDefault(); // allow dropping
+    };
+    const drop = (e: DragEvent) => {
+      e.preventDefault(); // don't let the browser open the file
+      depth = 0;
+      setDragging(false);
+      const files = [...(e.dataTransfer?.files ?? [])];
+      if (files.length) onFiles(files);
+    };
+    addEventListener("dragenter", enter);
+    addEventListener("dragleave", leave);
+    addEventListener("dragover", over);
+    addEventListener("drop", drop);
+    return () => {
+      setDragging(false);
+      removeEventListener("dragenter", enter);
+      removeEventListener("dragleave", leave);
+      removeEventListener("dragover", over);
+      removeEventListener("drop", drop);
+    };
+  }, [enabled, onFiles]);
+
+  return dragging;
+}
+
+/** Count chat messages that arrive while the tab is hidden, in its title. */
+function useUnreadTitle(log: LogEntry[]): void {
+  const [unread, setUnread] = useState(0);
+  const seen = useRef(log.length);
+
+  useEffect(() => {
+    const fresh = log.slice(seen.current).filter((e) => e.from === "peer").length;
+    seen.current = log.length;
+    if (fresh && document.hidden) setUnread((n) => n + fresh);
+  }, [log]);
+
+  useEffect(() => {
+    const onVisible = () => {
+      if (!document.hidden) setUnread(0);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, []);
+
+  useEffect(() => {
+    document.title = unread ? `(${unread}) Whoosh` : "Whoosh";
+    return () => {
+      document.title = "Whoosh";
+    };
+  }, [unread]);
+}
+
+function useWarnBeforeUnload(active: boolean): void {
+  useEffect(() => {
+    if (!active) return;
+    const warn = (e: BeforeUnloadEvent) => e.preventDefault();
+    addEventListener("beforeunload", warn);
+    return () => removeEventListener("beforeunload", warn);
+  }, [active]);
 }
 
 function StatusDot({ phase }: { phase: Phase }) {
@@ -188,40 +296,26 @@ function Chat({
 
 function Files({
   transfers,
+  queued,
   canSend,
   onSend,
   onCancel,
+  onUnqueue,
 }: {
   transfers: Transfer[];
+  queued: readonly QueuedFile[];
   canSend: boolean;
   onSend: (files: File[]) => void;
   onCancel: (id: string) => void;
+  onUnqueue: (id: string) => void;
 }) {
   const input = useRef<HTMLInputElement>(null);
-  const [dragging, setDragging] = useState(false);
-
-  const drop = (event: DragEvent) => {
-    event.preventDefault();
-    setDragging(false);
-    if (canSend) onSend([...event.dataTransfer.files]);
-  };
 
   return (
     <Card className="flex h-96 flex-col">
       <h2 className="font-medium">Files</h2>
-      <div
-        onDragOver={(e) => {
-          e.preventDefault();
-          if (canSend) setDragging(true);
-        }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={drop}
-        className={`mt-3 rounded-lg border-2 border-dashed p-4 text-center text-sm transition-colors ${
-          dragging
-            ? "border-sky-500 bg-sky-50 dark:bg-sky-950/40"
-            : "border-slate-300 dark:border-slate-700"
-        }`}
-      >
+      {/* Drops anywhere on the page are handled by usePageDrop */}
+      <div className="mt-3 rounded-lg border-2 border-dashed border-slate-300 p-4 text-center text-sm dark:border-slate-700">
         <p className="text-slate-600 dark:text-slate-400">
           {canSend ? "Drop files here or" : "Waiting for the connection…"}
         </p>
@@ -243,9 +337,32 @@ function Files({
       </div>
 
       <ul className="mt-3 flex-1 space-y-2 overflow-y-auto pr-1">
+        {queued.map((q, i) => (
+          <li
+            key={q.id}
+            className="flex items-center gap-2 rounded-lg border border-dashed border-slate-300 p-3 text-sm dark:border-slate-700"
+          >
+            <span aria-hidden>⏳</span>
+            <span className="min-w-0 flex-1 truncate" title={q.file.name}>
+              {q.file.name}
+            </span>
+            <span className="shrink-0 text-xs text-slate-500 dark:text-slate-400">
+              Queued #{i + 1} · {formatBytes(q.file.size)}
+            </span>
+            <button
+              className="text-xs text-slate-500 hover:text-red-600 dark:text-slate-400"
+              onClick={() => onUnqueue(q.id)}
+            >
+              Remove
+            </button>
+          </li>
+        ))}
         {[...transfers].reverse().map((t) => (
           <TransferRow key={t.id} transfer={t} onCancel={() => onCancel(t.id)} />
         ))}
+        {queued.length === 0 && transfers.length === 0 && (
+          <li className="text-sm text-slate-500 dark:text-slate-400">No files yet.</li>
+        )}
       </ul>
     </Card>
   );
@@ -254,7 +371,9 @@ function Files({
 function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: () => void }) {
   const pct = t.size ? (100 * t.bytesDone) / t.size : 100;
   const seconds = (performance.now() - t.startedAt) / 1000;
-  const rate = seconds > 0.5 ? `${formatBytes(t.bytesDone / seconds)}/s` : "";
+  const speed = seconds > 0.5 ? t.bytesDone / seconds : 0;
+  const rate = speed ? `${formatBytes(speed)}/s` : "";
+  const eta = speed ? formatDuration((t.size - t.bytesDone) / speed) : "";
   const arrow = t.direction === "send" ? "↑" : "↓";
 
   return (
@@ -276,7 +395,7 @@ function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: 
           </div>
           <div className="mt-1 flex items-center text-xs text-slate-500 dark:text-slate-400">
             <span className="flex-1">
-              {pct.toFixed(0)}% {rate && `· ${rate}`}
+              {pct.toFixed(0)}% {rate && `· ${rate}`} {eta && `· ${eta} left`}
             </span>
             <button className="hover:text-red-600" onClick={onCancel}>
               Cancel
@@ -310,4 +429,12 @@ function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: 
       )}
     </li>
   );
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 1) return "<1s";
+  if (seconds < 60) return `${Math.ceil(seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  if (m < 60) return `${m}m ${Math.ceil(seconds % 60)}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
 }

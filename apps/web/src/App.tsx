@@ -3,7 +3,10 @@ import { useEffect, useState } from "react";
 import { Home } from "./components/Home";
 import { Room } from "./components/Room";
 
-type Screen = { name: "home" } | { name: "room"; roomId: string; isCreator: boolean };
+type Screen =
+  | { name: "home" }
+  // attempt: bumped by "Try again" so the room remounts with a fresh connection
+  | { name: "room"; roomId: string; isCreator: boolean; attempt?: number };
 
 /** A shared link looks like https://host/#abcd1234 and opens straight into the room. */
 function roomFromHash(): string | undefined {
@@ -50,8 +53,14 @@ export default function App() {
             onJoin={(roomId) => setScreen({ name: "room", roomId, isCreator: false })}
           />
         ) : (
-          // key: a new room id gets a fresh connection
-          <Room key={screen.roomId} {...screen} onLeave={leave} />
+          // key: a new room id (or a retry) gets a fresh connection
+          <Room
+            key={`${screen.roomId}:${screen.attempt ?? 0}`}
+            roomId={screen.roomId}
+            isCreator={screen.isCreator}
+            onLeave={leave}
+            onRetry={() => setScreen({ ...screen, attempt: (screen.attempt ?? 0) + 1 })}
+          />
         )}
       </main>
 
