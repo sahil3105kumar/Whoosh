@@ -33,8 +33,8 @@ function makePair(confirmTimeoutMs = 2000) {
   const a = new MemoryChannel();
   const b = new MemoryChannel();
   const updates: Transfer[] = [];
-  const sender = new TransferManager(a, () => {}, confirmTimeoutMs);
-  const receiver = new TransferManager(b, (t) => updates.push(t));
+  const sender = new TransferManager(a, () => {}, { confirmTimeoutMs, partials: new Map() });
+  const receiver = new TransferManager(b, (t) => updates.push(t), { partials: new Map() });
   a.peer = receiver;
   b.peer = sender;
   return { a, b, sender, receiver, updates, last: () => updates.at(-1)! };

@@ -23,8 +23,8 @@ from packages.protocol.models import (
     HelloPayload,
     PingPayload,
     PongPayload,
-    ProgressPayload,
     ProtocolMessage,
+    TransferAckPayload,
     TransferCancelPayload,
     TransferCompletePayload,
     make_message,
@@ -72,13 +72,12 @@ class TestRoundTrips:
         assert decoded.payload.filename == "notes.txt"
         assert decoded.payload.size == 1024
 
-    def test_progress(self):
+    def test_transfer_ack(self):
         original = make_message(
-            MessageType.PROGRESS,
-            ProgressPayload(transfer_id="t1", bytes_transferred=512, total_bytes=1024),
+            MessageType.TRANSFER_ACK, TransferAckPayload(transfer_id="t1", offset=1024)
         )
         decoded = _roundtrip(original)
-        assert decoded.payload.bytes_transferred == 512
+        assert decoded.payload.offset == 1024
 
     def test_transfer_complete(self):
         original = make_message(

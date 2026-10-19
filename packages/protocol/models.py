@@ -43,14 +43,29 @@ class FileMetadataPayload(Payload):
     filename: str
     size: int
     mime_type: str = "application/octet-stream"
+    #: Set only when the receiver advertised ``resume``: identifies the
+    #: file across sessions so a partial copy can be continued. The
+    #: receiver must answer with ``transfer_accept``.
+    resume_key: str | None = None
+    #: The sender wants transfer_ack messages. Set only when the receiver
+    #: advertised ``ack``.
+    ack: bool = False
 
 
-class ProgressPayload(Payload):
-    """Transfer progress update."""
+class TransferAckPayload(Payload):
+    """Receiver → sender: every byte before ``offset`` has been written to
+    storage. Sent periodically while receiving, when file_metadata asked."""
 
     transfer_id: str
-    bytes_transferred: int
-    total_bytes: int
+    offset: int
+
+
+class TransferAcceptPayload(Payload):
+    """Receiver's answer to a file_metadata carrying a resume_key: start at
+    ``offset`` (bytes it already holds; 0 = from the beginning)."""
+
+    transfer_id: str
+    offset: int
 
 
 class TransferCompletePayload(Payload):
@@ -91,6 +106,11 @@ class PongPayload(Payload):
     timestamp: float
 
 
+class ByePayload(Payload):
+    """Sent just before leaving on purpose, so the other side ends the
+    session instead of trying to reconnect (docs/decisions.md D50)."""
+
+
 # ---------------------------------------------------------------------------
 # Discriminated union of all payload types
 # ---------------------------------------------------------------------------
@@ -99,12 +119,14 @@ AnyPayload = Annotated[
     HelloPayload
     | ChatPayload
     | FileMetadataPayload
-    | ProgressPayload
     | TransferCompletePayload
     | TransferCancelPayload
+    | TransferAcceptPayload
+    | TransferAckPayload
     | ErrorPayload
     | PingPayload
-    | PongPayload,
+    | PongPayload
+    | ByePayload,
     Field(discriminator=None),
 ]
 

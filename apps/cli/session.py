@@ -6,19 +6,23 @@ file transfer. Terminal output goes through ``Ui``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
+from apps.cli import history
 from packages.protocol.codec import decode, encode
 from packages.protocol.enums import Capability, MessageType
 from packages.protocol.exceptions import ProtocolError
 from packages.protocol.models import (
+    ByePayload,
     ChatPayload,
     ErrorPayload,
     HelloPayload,
@@ -34,7 +38,19 @@ from packages.transfer.manager import Direction, Transfer, TransferManager, Tran
 
 log = logging.getLogger(__name__)
 
-CAPABILITIES = [Capability.CHAT, Capability.FILE_TRANSFER, Capability.CANCEL]
+CAPABILITIES = [
+    Capability.CHAT,
+    Capability.FILE_TRANSFER,
+    Capability.CANCEL,
+    Capability.RESUME,
+    Capability.ACK,
+]
+
+
+def shown_bytes(t: Transfer) -> int:
+    """Progress to display: for a sender with acks, what the receiver has
+    stored rather than what was handed to the network."""
+    return t.bytes_acked if t.direction is Direction.SEND and t.acked else t.bytes_done
 
 
 def format_bytes(n: float) -> str:
@@ -116,12 +132,18 @@ class Ui:
         arrow = self.style.accent("↑" if t.direction is Direction.SEND else "↓")
         started = self._started.setdefault(t.id, time.monotonic())
         elapsed = max(time.monotonic() - started, 1e-6)
-        speed = t.bytes_done / elapsed
+        sent_now = shown_bytes(t) - t.resumed_from  # speed counts this session only
+        speed = sent_now / elapsed
 
         if t.status is TransferStatus.STREAMING:
+            if t.bytes_done == t.resumed_from:  # first report for this transfer
+                note = ""
+                if t.resumed_from:
+                    pct = 100 * t.resumed_from / t.size
+                    note = f", resuming from {pct:.0f}%"
+                if not self._tty or note:
+                    self.line(f"{arrow} {t.filename} ({format_bytes(t.size)}{note})...")
             if not self._tty:
-                if t.bytes_done == 0:
-                    self.line(f"{arrow} {t.filename} ({format_bytes(t.size)})...")
                 return
             self._draw_progress(arrow, t, speed)
             return
@@ -130,17 +152,20 @@ class Ui:
         if t.status is TransferStatus.COMPLETED:
             where = f"saved to {t.path}" if t.direction is Direction.RECEIVE else "delivered"
             details = format_bytes(t.size)
-            if t.size >= 1024 * 1024:  # below this, setup time dominates the "speed"
-                details += f", {format_bytes(t.size / elapsed)}/s"
+            if sent_now >= 1024 * 1024:  # below this, setup time dominates the "speed"
+                details += f", {format_bytes(sent_now / elapsed)}/s"
+            if t.resumed_from:
+                details += f", resumed from {100 * t.resumed_from / t.size:.0f}%"
             self.line(f"{arrow} {t.filename}: {self.style.ok(where)} {self.style.dim(details)}")
         else:
             self.error(f"{t.filename}: {t.status} ({t.reason})")
 
     def _draw_progress(self, arrow: str, t: Transfer, speed: float) -> None:
-        fraction = t.bytes_done / t.size if t.size else 1.0
-        eta = format_duration((t.size - t.bytes_done) / speed) if speed > 0 else "?"
+        done = shown_bytes(t)
+        fraction = done / t.size if t.size else 1.0
+        eta = format_duration((t.size - done) / speed) if speed > 0 else "?"
         stats = (
-            f" {100 * fraction:3.0f}%  {format_bytes(t.bytes_done)}/{format_bytes(t.size)}"
+            f" {100 * fraction:3.0f}%  {format_bytes(done)}/{format_bytes(t.size)}"
             f"  {format_bytes(speed)}/s  ETA {eta}"
         )
         columns = shutil.get_terminal_size().columns
@@ -160,17 +185,71 @@ class Ui:
 
 
 class Session:
-    def __init__(self, peer: WebRTCPeer, download_dir: Path, ui: Ui) -> None:
+    """The protocol conversation with the other peer. Survives reconnects:
+    ``attach`` moves it onto each new connection (D50)."""
+
+    def __init__(
+        self,
+        peer: WebRTCPeer,
+        download_dir: Path,
+        ui: Ui,
+        *,
+        on_stall: Callable[[], None] | None = None,
+    ) -> None:
         self._peer = peer
         self._ui = ui
-        self.transfers = TransferManager(peer, download_dir, on_update=ui.transfer_update)
+        self.transfers = TransferManager(
+            peer, download_dir, on_update=self._on_transfer, on_stall=on_stall
+        )
         #: Resolved with the peer's capabilities when its hello arrives.
         self.peer_hello: asyncio.Future[set[Capability]] = (
             asyncio.get_running_loop().create_future()
         )
+        #: Set while attached to a live connection.
+        self.connected = asyncio.Event()
+        self.connected.set()
+        #: The other side said bye: it left on purpose, don't reconnect.
+        self.peer_left = False
+        #: Bumped on every reconnect, so waiters can tell a new connection
+        #: from the one that just failed.
+        self.generation = 0
 
     def start(self) -> None:
         self._send(MessageType.HELLO, HelloPayload(capabilities=CAPABILITIES))
+
+    def _on_transfer(self, transfer: Transfer) -> None:
+        self._ui.transfer_update(transfer)
+        if transfer.status.finished:  # reported exactly once, when it ends
+            history.record(transfer)
+
+    def attach(self, peer: WebRTCPeer) -> None:
+        """Continue on a new connection after a reconnect."""
+        self._peer = peer
+        self.transfers.attach(peer)
+        self.peer_hello = asyncio.get_running_loop().create_future()
+        self.generation += 1
+        self.connected.set()
+        self.start()
+
+    async def wait_ready(self, *, after: int, timeout: float) -> bool:
+        """Wait for a connection newer than generation ``after`` whose hello
+        has arrived. ``after=-1`` accepts the current one."""
+
+        async def ready() -> None:
+            while self.generation <= after or not self.connected.is_set():
+                await asyncio.sleep(0.05)
+            await asyncio.shield(self.peer_hello)
+
+        try:
+            await asyncio.wait_for(ready(), timeout)
+        except TimeoutError:
+            return False
+        return True
+
+    def say_bye(self) -> None:
+        """Tell the other side we're leaving on purpose."""
+        with contextlib.suppress(ConnectionError):
+            self._send(MessageType.BYE, ByePayload())
 
     async def run_inbound(self) -> None:
         """Process incoming messages until the channel closes."""
@@ -190,6 +269,7 @@ class Session:
             log.debug("recv %s", msg.type)
             await self._dispatch(msg)
 
+        self.connected.clear()
         self.transfers.close("connection closed")
 
     async def _dispatch(self, msg: ProtocolMessage) -> None:
@@ -206,6 +286,8 @@ class Session:
         elif isinstance(payload, PongPayload):
             rtt_ms = (time.monotonic() - payload.timestamp) * 1000
             self._ui.hint(f"pong: {rtt_ms:.1f} ms round trip")
+        elif isinstance(payload, ByePayload):
+            self.peer_left = True
         elif isinstance(payload, ErrorPayload):
             # Never answer an error with an error — that's how loops start
             self._ui.error(f"peer reported an error: {payload.code}: {payload.message}")
@@ -218,6 +300,13 @@ class Session:
     def ping(self) -> None:
         # Monotonic is fine across machines: the peer only echoes it back
         self._send(MessageType.PING, PingPayload(timestamp=time.monotonic()))
+
+    def send_options(self) -> dict[str, bool]:
+        """send_file options for what the peer supports."""
+        return {
+            "resume": self.peer_can(Capability.RESUME),
+            "ack": self.peer_can(Capability.ACK),
+        }
 
     def peer_can(self, capability: Capability) -> bool:
         return self.peer_hello.done() and capability in self.peer_hello.result()

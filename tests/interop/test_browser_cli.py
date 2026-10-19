@@ -183,7 +183,8 @@ class Cli:
 
 def pattern_bytes(size: int, seed: int) -> bytes:
     """Deterministic content both sides can generate: (i*31 + seed) % 256."""
-    return bytes((i * 31 + seed) % 256 for i in range(size))
+    period = bytes((i * 31 + seed) % 256 for i in range(256))  # repeats every 256 bytes
+    return (period * (size // 256 + 1))[:size]
 
 
 async def create_room(page: Page, server: str) -> str:
@@ -197,21 +198,34 @@ async def wait_connected(page: Page) -> None:
     await page.get_by_text("Connected peer-to-peer").wait_for(timeout=TIMEOUT_S * 1000)
 
 
-async def drop_file(page: Page, name: str, size: int, seed: int) -> None:
-    """Drop a generated file on the drop zone, as a user dragging it in would."""
+async def drop_file(
+    page: Page, name: str, size: int, seed: int, last_modified: int = 1_000
+) -> None:
+    """Drop a generated file on the drop zone, as a user dragging it in would.
+    A fixed ``last_modified`` makes re-drops of the same file resumable."""
     # The zone accepts files only once the peer's hello has arrived
     await page.get_by_text("Drop files here").wait_for(timeout=TIMEOUT_S * 1000)
     await page.evaluate(
-        """([name, size, seed]) => {
+        """([name, size, seed, lastModified]) => {
             const bytes = new Uint8Array(size);
             for (let i = 0; i < size; i++) bytes[i] = (i * 31 + seed) % 256;
             const dt = new DataTransfer();
-            dt.items.add(new File([bytes], name));
+            dt.items.add(new File([bytes], name, { lastModified }));
             const zone = [...document.querySelectorAll("div")]
                 .find((d) => d.innerText?.startsWith("Drop files here"));
             zone.dispatchEvent(new DragEvent("drop", { dataTransfer: dt, bubbles: true }));
         }""",
-        [name, size, seed],
+        [name, size, seed, last_modified],
+    )
+
+
+async def wait_progress(page: Page, percent: int) -> None:
+    """Wait until a transfer row shows at least ``percent``% done."""
+    await page.wait_for_function(
+        """(min) => [...document.body.innerText.matchAll(/(\\d+)% ·/g)]
+                .some((m) => Number(m[1]) >= min)""",
+        arg=percent,
+        timeout=TIMEOUT_S * 1000,
     )
 
 
@@ -307,3 +321,148 @@ async def test_browser_to_browser(server: str, browser: Browser):
 
     expected = hashlib.sha256(pattern_bytes(3_000_000, seed=7)).hexdigest()
     assert await received_sha256(bob, "between-browsers.bin") == expected
+
+    # History (#22): both sides list it on the home page after leaving
+    for page in (alice, bob):
+        await page.get_by_role("button", name="Leave").click()
+        await page.get_by_text("Recent transfers").wait_for(timeout=TIMEOUT_S * 1000)
+        assert await page.get_by_text("between-browsers.bin").count() == 1
+
+
+# ── Resume (#17) ────────────────────────────────────────────────────
+
+
+async def test_browser_to_cli_resumes_after_page_closes(
+    server: str, browser: Browser, tmp_path: Path
+):
+    size = 40_000_000
+    page = await browser.new_page()
+    room = await create_room(page, server)
+    cli = await Cli.start(server, "receive", room, "--out", str(tmp_path))
+    try:
+        await drop_file(page, "big.bin", size, seed=3)
+        await wait_progress(page, 20)
+        # Close the tab mid-transfer. Playwright skips unload handlers, so
+        # fire pagehide as a real browser would: the page says bye
+        await page.evaluate("dispatchEvent(new PageTransitionEvent('pagehide'))")
+        await asyncio.sleep(0.3)  # a real tab takes this long to tear down anyway
+        await page.close()
+        assert await cli.exit_code() == 1, cli.output()
+        assert list((tmp_path / ".whoosh-partial").glob("*.part")), "partial was not kept"
+    finally:
+        await cli.close()
+
+    page = await browser.new_page()
+    room = await create_room(page, server)
+    cli = await Cli.start(server, "receive", room, "--out", str(tmp_path))
+    try:
+        await drop_file(page, "big.bin", size, seed=3)  # same file again
+        await page.get_by_text("Delivered").wait_for(timeout=TIMEOUT_S * 1000)
+        await page.get_by_role("button", name="Leave").click()
+        assert await cli.exit_code() == 0, cli.output()
+        assert "resuming from" in cli.output()
+        assert (tmp_path / "big.bin").read_bytes() == pattern_bytes(size, seed=3)
+        assert not (tmp_path / ".whoosh-partial").exists()
+    finally:
+        await cli.close()
+
+
+async def test_cli_to_browser_resumes_after_cli_is_killed(
+    server: str, browser: Browser, tmp_path: Path
+):
+    src = tmp_path / "big.bin"
+    src.write_bytes(os.urandom(120_000_000))
+    page = await browser.new_page()
+
+    cli = await Cli.start(server, "send", str(src))
+    try:
+        room = (await cli.wait_for(r"Room created: ([0-9a-f]{8})"))[1]
+        await page.goto(f"{server}/#{room}")
+        await wait_progress(page, 20)
+        cli.proc.kill()  # the sender vanishes mid-transfer
+        # No bye arrived, so the browser assumes a network problem and tries
+        # to get the connection back (#19)
+        await page.get_by_text("reconnecting").wait_for(timeout=TIMEOUT_S * 1000)
+    finally:
+        await cli.close()
+
+    # Same tab, new room: the browser still holds the partial in memory
+    cli = await Cli.start(server, "send", str(src))
+    try:
+        room = (await cli.wait_for(r"Room created: ([0-9a-f]{8})"))[1]
+        await page.goto(f"{server}/#{room}")
+        digest = await received_sha256(page, src.name)
+        assert digest == hashlib.sha256(src.read_bytes()).hexdigest()
+        assert await cli.exit_code() == 0, cli.output()
+        assert "resuming from" in cli.output()
+        assert await page.get_by_text("resumed from").count() >= 1
+    finally:
+        await cli.close()
+
+
+# ── Automatic reconnection (#19) ────────────────────────────────────
+
+#: Keeps every RTCPeerConnection the page creates, so a test can cut one.
+CAPTURE_PCS = """
+window.__pcs = [];
+const Original = RTCPeerConnection;
+window.RTCPeerConnection = function (...args) {
+  const pc = new Original(...args);
+  window.__pcs.push(pc);
+  return pc;
+};
+window.RTCPeerConnection.prototype = Original.prototype;
+"""
+
+
+async def cut_connection(page: Page) -> None:
+    """Kill the page's live peer-to-peer connection, as a network failure would."""
+    await page.evaluate("window.__pcs.at(-1).close()")
+
+
+async def test_cli_send_survives_a_dropped_connection(
+    server: str, browser: Browser, tmp_path: Path
+):
+    src = tmp_path / "big.bin"
+    src.write_bytes(os.urandom(120_000_000))
+    page = await browser.new_page()
+    await page.add_init_script(CAPTURE_PCS)
+
+    cli = await Cli.start(server, "send", str(src))
+    try:
+        room = (await cli.wait_for(r"Room created: ([0-9a-f]{8})"))[1]
+        await page.goto(f"{server}/#{room}")
+        await wait_progress(page, 20)
+        await cut_connection(page)
+
+        # Nobody does anything: both sides reconnect and the send resumes
+        digest = await received_sha256(page, src.name)
+        assert digest == hashlib.sha256(src.read_bytes()).hexdigest()
+        assert await cli.exit_code() == 0, cli.output()
+        assert "Reconnected" in cli.output()
+        assert "resuming from" in cli.output()
+    finally:
+        await cli.close()
+
+
+async def test_browser_send_survives_a_dropped_connection(
+    server: str, browser: Browser, tmp_path: Path
+):
+    size = 40_000_000
+    page = await browser.new_page()
+    await page.add_init_script(CAPTURE_PCS)
+    room = await create_room(page, server)
+    cli = await Cli.start(server, "receive", room, "--out", str(tmp_path))
+    try:
+        await drop_file(page, "big.bin", size, seed=5)
+        await wait_progress(page, 20)
+        await cut_connection(page)
+
+        await page.get_by_text("Delivered").wait_for(timeout=TIMEOUT_S * 1000)
+        await page.get_by_role("button", name="Leave").click()  # says bye
+        assert await cli.exit_code() == 0, cli.output()
+        assert "Reconnected" in cli.output()
+        assert "resuming from" in cli.output()
+        assert (tmp_path / "big.bin").read_bytes() == pattern_bytes(size, seed=5)
+    finally:
+        await cli.close()

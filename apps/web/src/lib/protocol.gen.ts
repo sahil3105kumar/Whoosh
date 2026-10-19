@@ -2,9 +2,9 @@
 
 export const PROTOCOL_VERSION = 1;
 
-export type MessageType = "hello" | "chat" | "file_metadata" | "progress" | "transfer_complete" | "transfer_cancel" | "error" | "ping" | "pong";
+export type MessageType = "hello" | "chat" | "file_metadata" | "transfer_complete" | "transfer_cancel" | "transfer_accept" | "transfer_ack" | "error" | "ping" | "pong" | "bye";
 
-export type Capability = "chat" | "file_transfer" | "cancel";
+export type Capability = "chat" | "file_transfer" | "cancel" | "resume" | "ack";
 
 /** Capability negotiation sent immediately after the DataChannel opens. */
 export interface HelloPayload {
@@ -22,13 +22,8 @@ export interface FileMetadataPayload {
   filename: string;
   size: number;
   mime_type?: string;
-}
-
-/** Transfer progress update. */
-export interface ProgressPayload {
-  transfer_id: string;
-  bytes_transferred: number;
-  total_bytes: number;
+  resume_key?: string | null;
+  ack?: boolean;
 }
 
 /** Signals that a file transfer finished successfully. */
@@ -41,6 +36,18 @@ export interface TransferCompletePayload {
 export interface TransferCancelPayload {
   transfer_id: string;
   reason?: string;
+}
+
+/** Receiver's answer to a file_metadata carrying a resume_key: start at ``offset`` (bytes it already holds; 0 = from the beginning). */
+export interface TransferAcceptPayload {
+  transfer_id: string;
+  offset: number;
+}
+
+/** Receiver → sender: every byte before ``offset`` has been written to storage. Sent periodically while receiving, when file_metadata asked. */
+export interface TransferAckPayload {
+  transfer_id: string;
+  offset: number;
 }
 
 /** Reports a protocol or transfer error. */
@@ -59,58 +66,72 @@ export interface PongPayload {
   timestamp: number;
 }
 
+/** Sent just before leaving on purpose, so the other side ends the session instead of trying to reconnect (docs/decisions.md D50). */
+export interface ByePayload {
+}
+
 export interface MessageMap {
   hello: HelloPayload;
   chat: ChatPayload;
   file_metadata: FileMetadataPayload;
-  progress: ProgressPayload;
   transfer_complete: TransferCompletePayload;
   transfer_cancel: TransferCancelPayload;
+  transfer_accept: TransferAcceptPayload;
+  transfer_ack: TransferAckPayload;
   error: ErrorPayload;
   ping: PingPayload;
   pong: PongPayload;
+  bye: ByePayload;
 }
 
 export type FieldKind = "string" | "integer" | "number" | "boolean" | "string[]";
 export interface FieldSpec {
   kind: FieldKind;
   optional: boolean;
+  nullable: boolean;
 }
 
 export const PAYLOAD_FIELDS: Record<MessageType, Record<string, FieldSpec>> = {
   hello: {
-    capabilities: { kind: "string[]", optional: false },
+    capabilities: { kind: "string[]", optional: false, nullable: false },
   },
   chat: {
-    text: { kind: "string", optional: false },
+    text: { kind: "string", optional: false, nullable: false },
   },
   file_metadata: {
-    transfer_id: { kind: "string", optional: false },
-    filename: { kind: "string", optional: false },
-    size: { kind: "integer", optional: false },
-    mime_type: { kind: "string", optional: true },
-  },
-  progress: {
-    transfer_id: { kind: "string", optional: false },
-    bytes_transferred: { kind: "integer", optional: false },
-    total_bytes: { kind: "integer", optional: false },
+    transfer_id: { kind: "string", optional: false, nullable: false },
+    filename: { kind: "string", optional: false, nullable: false },
+    size: { kind: "integer", optional: false, nullable: false },
+    mime_type: { kind: "string", optional: true, nullable: false },
+    resume_key: { kind: "string", optional: true, nullable: true },
+    ack: { kind: "boolean", optional: true, nullable: false },
   },
   transfer_complete: {
-    transfer_id: { kind: "string", optional: false },
-    sha256: { kind: "string", optional: false },
+    transfer_id: { kind: "string", optional: false, nullable: false },
+    sha256: { kind: "string", optional: false, nullable: false },
   },
   transfer_cancel: {
-    transfer_id: { kind: "string", optional: false },
-    reason: { kind: "string", optional: true },
+    transfer_id: { kind: "string", optional: false, nullable: false },
+    reason: { kind: "string", optional: true, nullable: false },
+  },
+  transfer_accept: {
+    transfer_id: { kind: "string", optional: false, nullable: false },
+    offset: { kind: "integer", optional: false, nullable: false },
+  },
+  transfer_ack: {
+    transfer_id: { kind: "string", optional: false, nullable: false },
+    offset: { kind: "integer", optional: false, nullable: false },
   },
   error: {
-    code: { kind: "string", optional: false },
-    message: { kind: "string", optional: false },
+    code: { kind: "string", optional: false, nullable: false },
+    message: { kind: "string", optional: false, nullable: false },
   },
   ping: {
-    timestamp: { kind: "number", optional: false },
+    timestamp: { kind: "number", optional: false, nullable: false },
   },
   pong: {
-    timestamp: { kind: "number", optional: false },
+    timestamp: { kind: "number", optional: false, nullable: false },
+  },
+  bye: {
   },
 };

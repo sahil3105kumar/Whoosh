@@ -110,6 +110,10 @@ whoosh receive <room code>        # on the other machine
 ```
 
 Or chat: `whoosh create` / `whoosh join <room code>`, then `/send PATH`.
+`whoosh history` lists past transfers (kept only on your machine).
+
+Interrupted transfers resume where they stopped, and a dropped
+connection is re-established automatically.
 
 Or use the web app: open the server's address in a browser, create a
 room, and share the invite link. It works with CLI peers too.

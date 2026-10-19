@@ -30,7 +30,10 @@ Every text frame is one message in the same envelope.
 ### hello
 
 Sent by both peers as soon as the channel opens.
-`{"capabilities": ["chat", "file_transfer", "cancel"]}`
+`{"capabilities": ["chat", "file_transfer", "cancel", "resume", "ack"]}`
+
+Optional behaviour (like `resume`) is used only when *both* peers
+advertise it, so clients with different feature sets still interoperate.
 
 A peer must not start a file transfer until the other side's `hello`
 has advertised `file_transfer`.
@@ -42,10 +45,22 @@ has advertised `file_transfer`.
 ### file_metadata
 
 Announces an incoming file. Sender → receiver.
-`{"transfer_id": "<uuid hex>", "filename": "...", "size": 123, "mime_type": "..."}`
+`{"transfer_id": "<uuid hex>", "filename": "...", "size": 123, "mime_type": "...", "resume_key": "<hex>" | null, "ack": false}`
+
+`resume_key` is sent only when the receiver advertised `resume`; the
+receiver must then answer with `transfer_accept`. It identifies the
+file across sessions (see [Resume](#resume)). `ack: true` (sent only
+when the receiver advertised `ack`) asks for `transfer_ack` messages.
 
 `filename` is a suggestion only: the receiver strips any directory
 components and picks a non-colliding name in its download directory.
+
+### transfer_accept
+
+`{"transfer_id": "...", "offset": 0}` — receiver → sender, in answer to
+a `file_metadata` that carried a `resume_key`. `offset` is how many
+bytes of the file the receiver already holds; the sender streams from
+there. 0 means start from the beginning.
 
 ### transfer_complete
 
@@ -68,16 +83,32 @@ for a user cancel or for an error (checksum mismatch, disk full,
 out-of-order chunk, rejected metadata). The receiver deletes any
 partial data. Chunks still in flight after a cancel are dropped.
 
-### progress
+### transfer_ack
 
-Reserved. In v1 each side computes progress locally; v2.0 will use this
-for chunk acknowledgements and resume.
+`{"transfer_id": "...", "offset": 1048576}` — receiver → sender, when
+`file_metadata` asked for acks: every byte before `offset` has been
+written to storage. Sent each time another 1 MiB is stored; the final
+`transfer_complete` echo covers the tail.
+
+The sender shows acknowledged bytes as its progress and keeps at most
+8 MiB unacknowledged. A full window with no ack for 20 s fails the
+transfer as stalled: the connection is dead even if it hasn't said so.
+Acks outside `[last ack, bytes sent]` are ignored.
 
 ### error
 
 `{"code": "...", "message": "..."}` — the peer sent something that
 couldn't be decoded (`bad_message`, `bad_frame`). Never answered with
 another error.
+
+### bye
+
+`{}` — sent just before leaving on purpose (quit, Leave, tab closed, a
+one-shot send finished). The receiver ends the session. Without a `bye`,
+a closed connection is treated as a network failure and both sides try
+to reconnect (see [Reconnection](#reconnection)). Best-effort: a closing
+browser tab may not get it out in time, in which case the other side
+gives up after its reconnect window.
 
 ### ping / pong
 
@@ -107,6 +138,56 @@ sender                                   receiver
   │ transfer_complete (sha256) ────────────▶ │  verify size + hash, rename
   │ ◀──────────────────── transfer_complete  │
 ```
+
+## Resume
+
+An interrupted transfer continues when the same file is sent again, in
+any later session or room.
+
+**Resume key** — computed by the sender, identical in both clients:
+
+```
+sha256(
+  utf8("whoosh-resume-v1\n{size}\n{mtime_ms}\n")
+  || file[0 : min(1 MiB, size)]
+  || file[max(0, size - 1 MiB) : size]
+)  →  lowercase hex
+```
+
+`mtime_ms` is the modification time in whole milliseconds. A false match
+can't corrupt anything: the full-file SHA-256 in `transfer_complete` is
+still verified.
+
+**Sequence** with a partial copy of 400 of 1000 bytes on the receiver:
+
+```
+sender                                   receiver
+  │ file_metadata (resume_key) ────────────▶ │  finds partial: 400 bytes
+  │ ◀──────────────── transfer_accept (400)  │
+  │ chunk @400, ... ──────────────────────▶ │  append, hash (prefix re-hashed)
+  │ transfer_complete (sha256 of all 1000) ▶ │  verify, rename
+  │ ◀──────────────────── transfer_complete  │
+```
+
+The sender hashes the skipped prefix locally, so the final SHA-256 still
+covers the whole file. Partial data is kept when the connection drops,
+and deleted on `transfer_cancel` or any integrity failure.
+
+## Reconnection
+
+When the peer-to-peer connection drops without a `bye` (lost network,
+crash, or a transfer stalling with no acks), both sides keep their slot
+in the room and reconnect:
+
+* A dropped signaling WebSocket reconnects with `?peer_id=` to reclaim
+  its slot.
+* The room creator sends a fresh offer whenever the connection is down
+  and both peers are on signaling (on its own reconnect, on
+  `peer_joined`, and shortly after a drop). The joiner accepts any new
+  offer, replacing its old connection.
+* On the new connection both sides send `hello` again. Interrupted
+  outgoing transfers are re-sent (up to 3 attempts per file) and resume
+  from the receiver's partial copy.
 
 ## Versioning
 

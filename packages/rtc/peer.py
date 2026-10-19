@@ -43,11 +43,20 @@ class WebRTCPeer:
         # Incoming messages in arrival order; None marks channel close.
         self._inbox: asyncio.Queue[str | bytes | None] = asyncio.Queue()
         self._buffer_low = asyncio.Event()
+        self._closed = False
+        self._closed_event = asyncio.Event()
 
         @self.pc.on("datachannel")
         def on_datachannel(ch: RTCDataChannel) -> None:
             self.channel = ch
             self._wire_channel()
+
+        # A peer that dies (crash, lost network) never closes the channel;
+        # the connection failing ICE consent checks is the only sign
+        @self.pc.on("connectionstatechange")
+        def on_connection_state() -> None:
+            if self.pc.connectionState in ("failed", "closed"):
+                self._mark_closed()
 
     async def create_offer(self) -> None:
         """Initiator calls this to create the DataChannel and send an offer."""
@@ -88,9 +97,23 @@ class WebRTCPeer:
         """
         return await self._inbox.get()
 
+    @property
+    def max_message_size(self) -> int:
+        """Largest message to send. aiortc accepts (and advertises) 64 KiB;
+        browsers accept at least that, so it's safe whoever the peer is."""
+        return 65536
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def wait_closed(self) -> None:
+        """Wait until the channel ends, by whatever path."""
+        await self._closed_event.wait()
+
     def send(self, data: str | bytes) -> None:
         """Send one message. Raises ConnectionError if the channel isn't open."""
-        if self.channel is None or self.channel.readyState != "open":
+        if self._closed or self.channel is None or self.channel.readyState != "open":
             raise ConnectionError("DataChannel is not open")
         self.channel.send(data)
 
@@ -101,7 +124,7 @@ class WebRTCPeer:
         at network speed instead of being queued into memory whole.
         """
         while True:
-            if self.channel is None or self.channel.readyState != "open":
+            if self._closed or self.channel is None or self.channel.readyState != "open":
                 raise ConnectionError("DataChannel is not open")
             if self.channel.bufferedAmount <= HIGH_WATER_BYTES:
                 return
@@ -136,8 +159,16 @@ class WebRTCPeer:
 
         @channel.on("close")
         def on_close() -> None:
-            self._inbox.put_nowait(None)
-            self._buffer_low.set()  # wake drain() so it sees the closed state
+            self._mark_closed()
+
+    def _mark_closed(self) -> None:
+        """Signal the end of the channel exactly once, whatever detected it."""
+        if self._closed:
+            return
+        self._closed = True
+        self._closed_event.set()
+        self._inbox.put_nowait(None)
+        self._buffer_low.set()  # wake drain() so it sees the closed state
 
     async def close(self) -> None:
         await self.pc.close()

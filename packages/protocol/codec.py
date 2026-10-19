@@ -19,6 +19,7 @@ from packages.protocol.exceptions import (
     UnsupportedVersionError,
 )
 from packages.protocol.models import (
+    ByePayload,
     ChatPayload,
     ErrorPayload,
     FileMetadataPayload,
@@ -26,8 +27,9 @@ from packages.protocol.models import (
     Payload,
     PingPayload,
     PongPayload,
-    ProgressPayload,
     ProtocolMessage,
+    TransferAcceptPayload,
+    TransferAckPayload,
     TransferCancelPayload,
     TransferCompletePayload,
 )
@@ -37,12 +39,14 @@ PAYLOAD_REGISTRY: dict[MessageType, type[Payload]] = {
     MessageType.HELLO: HelloPayload,
     MessageType.CHAT: ChatPayload,
     MessageType.FILE_METADATA: FileMetadataPayload,
-    MessageType.PROGRESS: ProgressPayload,
     MessageType.TRANSFER_COMPLETE: TransferCompletePayload,
     MessageType.TRANSFER_CANCEL: TransferCancelPayload,
+    MessageType.TRANSFER_ACCEPT: TransferAcceptPayload,
+    MessageType.TRANSFER_ACK: TransferAckPayload,
     MessageType.ERROR: ErrorPayload,
     MessageType.PING: PingPayload,
     MessageType.PONG: PongPayload,
+    MessageType.BYE: ByePayload,
 }
 
 

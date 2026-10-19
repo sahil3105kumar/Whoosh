@@ -27,6 +27,17 @@ OUT = Path(__file__).resolve().parent.parent / "apps/web/src/lib/protocol.gen.ts
 _SCALARS = {"string": "string", "integer": "number", "number": "number", "boolean": "boolean"}
 
 
+def _split_nullable(schema: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """``X | None`` arrives as anyOf [X, null]: return (X, True)."""
+    variants = schema.get("anyOf")
+    if variants is None:
+        return schema, False
+    rest = [v for v in variants if v.get("type") != "null"]
+    if len(rest) != 1 or len(rest) == len(variants):
+        raise ValueError(f"unsupported union: {schema}")
+    return rest[0], True
+
+
 def _field_kind(schema: dict[str, Any]) -> str:
     """Runtime check kind for a field, as understood by protocol.ts."""
     if "$ref" in schema:
@@ -63,11 +74,14 @@ def generate() -> str:
     for model in dict.fromkeys(PAYLOAD_REGISTRY.values()):
         schema = model.model_json_schema()
         required = set(schema.get("required", []))
-        out.append(f"\n/** {(model.__doc__ or '').strip().splitlines()[0]} */\n")
+        summary = " ".join((model.__doc__ or "").strip().split("\n\n")[0].split())
+        out.append(f"\n/** {summary} */\n")
         out.append(f"export interface {model.__name__} {{\n")
         for name, prop in schema["properties"].items():
             optional = "" if name in required else "?"
-            out.append(f"  {name}{optional}: {_ts_type(prop)};\n")
+            inner, nullable = _split_nullable(prop)
+            ts = _ts_type(inner) + (" | null" if nullable else "")
+            out.append(f"  {name}{optional}: {ts};\n")
         out.append("}\n")
 
     out.append("\nexport interface MessageMap {\n")
@@ -78,7 +92,8 @@ def generate() -> str:
     out.append(
         "\nexport type FieldKind = "
         '"string" | "integer" | "number" | "boolean" | "string[]";\n'
-        "export interface FieldSpec {\n  kind: FieldKind;\n  optional: boolean;\n}\n"
+        "export interface FieldSpec {\n  kind: FieldKind;\n  optional: boolean;\n"
+        "  nullable: boolean;\n}\n"
         "\nexport const PAYLOAD_FIELDS: Record<MessageType, Record<string, FieldSpec>> = {\n"
     )
     for msg_type, model in PAYLOAD_REGISTRY.items():
@@ -87,7 +102,11 @@ def generate() -> str:
         out.append(f"  {msg_type.value}: {{\n")
         for name, prop in schema["properties"].items():
             optional = "false" if name in required else "true"
-            out.append(f'    {name}: {{ kind: "{_field_kind(prop)}", optional: {optional} }},\n')
+            inner, nullable = _split_nullable(prop)
+            out.append(
+                f'    {name}: {{ kind: "{_field_kind(inner)}", optional: {optional}, '
+                f"nullable: {str(nullable).lower()} }},\n"
+            )
         out.append("  },\n")
     out.append("};\n")
     return "".join(out)

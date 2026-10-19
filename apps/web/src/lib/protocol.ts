@@ -48,6 +48,7 @@ export function decodeMessage(text: string): ProtocolMessage {
   for (const [name, spec] of Object.entries(PAYLOAD_FIELDS[type as MessageType])) {
     const value = payload[name];
     if (value === undefined && spec.optional) continue;
+    if (value === null && spec.nullable) continue;
     if (!matches(value, spec.kind)) {
       throw new ProtocolError(`${type}.${name}: expected ${spec.kind}`);
     }

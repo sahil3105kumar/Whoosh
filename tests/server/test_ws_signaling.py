@@ -225,3 +225,16 @@ async def test_disallowed_origin_closes_with_1008(monkeypatch: pytest.MonkeyPatc
             f"/rooms/{room_id}/ws", client, headers={"Origin": "https://evil.example"}
         ) as ws:
             await _expect_close(ws, 1008)
+
+
+async def test_hello_lists_peers_already_connected():
+    room_id = await _create_room()
+
+    async with _http_client() as client:
+        async with aconnect_ws(f"/rooms/{room_id}/ws", client) as first:
+            first_hello = await first.receive_json()
+            assert first_hello["peers"] == []
+            async with _http_client() as client2:
+                async with aconnect_ws(f"/rooms/{room_id}/ws", client2) as second:
+                    second_hello = await second.receive_json()
+                    assert second_hello["peers"] == [first_hello["peer_id"]]

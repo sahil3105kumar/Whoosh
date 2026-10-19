@@ -562,3 +562,176 @@ server is used unless `--server` is given (precedence: `--server`, link,
 ("Room x doesn't exist… rooms expire after 10 minutes").
 **Why** — Scripts and logs shouldn't get escape codes. Pasting the link someone
 sent you should just work, without knowing which server it came from.
+
+---
+
+## v2.0 — Reliable transfers
+
+### D46. Resume: sampled resume key, `transfer_accept`, negotiated capability
+*2026-10-19 — #17*
+
+**Decision** — When both peers advertise `resume`, `file_metadata`
+carries a `resume_key`: SHA-256 over the size, modification time, and
+first and last 1 MiB of the file (spec in protocol.md, with shared
+reference vectors in both test suites). The receiver answers
+`transfer_accept {offset}` with the bytes it already holds; the sender
+hashes that prefix locally and streams the rest. The protocol version
+stays 1.
+**Why** —
+- *Not a full-file hash:* that would read huge files twice before
+  sending a byte. A false match is harmless because the end-to-end
+  SHA-256 (D17) still has to pass.
+- *Byte offset:* chunk frames already carry byte offsets, chosen for
+  exactly this (D12).
+- *Capability, not version:* the new fields are additive and only used
+  when both sides opt in, so mixed clients keep working.
+- *Diverges from #17's wording* ("last acked chunk index", a
+  `transfer_resume` message): the receiver's own byte count is the
+  ground truth of what landed, so it needs no ack bookkeeping to resume.
+**Revisit** — If files are often modified in place between attempts and
+users expect resume anyway (the key changes with mtime).
+
+### D47. Where partials live, and when they're kept
+*2026-10-19 — #17*
+
+**Decision** —
+- *CLI:* partials are stored on disk in
+  `<download dir>/.whoosh-partial/<key>.part` with a `.json` sidecar
+  recording the size. They survive restarts, untouched ones are deleted
+  after 7 days, and the folder disappears when empty.
+- *Web:* partials stay in memory for the life of the tab, with the hash
+  state kept so resuming doesn't re-read data.
+- *Keep vs. discard:* a partial is kept when the connection drops, and
+  deleted on cancel (by either side) or any integrity failure
+  (checksum, offset, overflow). Transfers from senders without resume
+  never keep partials.
+
+**Why** — A cancel is a decision not to have the file; integrity failures
+mean the partial can't be trusted. Web persistence across reloads would
+need OPFS or IndexedDB and a quota story; in-tab covers the common
+case of a peer's network dropping.
+**Revisit** — Web persistence across reloads (OPFS).
+
+### D48. A peer that stops responding counts as gone
+*2026-10-19 — found while testing #17*
+
+**Decision** — Both clients treat the connection as closed when ICE
+reports `failed`; the web client also after `disconnected` for 8s. A
+single "closed" latch in each client feeds the session, whichever
+signal fires first.
+**Why** — A peer that crashes or loses its network never closes the
+DataChannel, so its "close" event may never arrive: the interop test
+that kills the CLI mid-transfer left the browser waiting indefinitely.
+ICE consent checks are the only signal. 8s rides out brief blips,
+which ICE recovers from by itself.
+
+### D49. Acknowledgements: `transfer_ack` every MiB, 8 MiB window, 20 s stall limit
+*2026-10-19 — #18*
+
+**Decision** — When both peers advertise `ack`, the receiver sends
+`transfer_ack {offset}` each time another 1 MiB is written (the CLI
+flushes to disk first: an ack is a promise the bytes are stored). The
+sender's progress counts acknowledged bytes, at most 8 MiB may be
+unacknowledged, and a full window with no ack for 20 s fails the
+transfer as stalled. `transfer_ack` replaces the reserved, never-used
+`progress` message.
+**Why** —
+- *Progress:* "sent" only means handed to the local SCTP stack.
+  Acknowledged bytes are what actually landed, which is what #18 asks for.
+- *Window:* bounds memory on a receiver that can't keep up, and turns
+  "no acks" into a reliable stall signal (#19).
+- *Granularity:* per MiB rather than per chunk; one ack per 64 chunks
+  costs almost nothing.
+- *Protocol change:* `progress` was never sent by anyone, so replacing
+  it costs nothing before a release (D14).
+
+### D50. Retry means reconnect and resume; `bye` marks a deliberate exit
+*2026-10-19 — #19*
+
+**Decision** — Both clients survive a dropped connection: the signaling
+socket reconnects with its `peer_id`, the room creator re-offers, the
+joiner accepts any new offer, and the session moves onto the new
+connection. Interrupted outgoing transfers are retried automatically
+(3 attempts per file); with resume (D46) only the missing part is sent
+again. A stalled transfer (D49) tears the dead connection down to
+trigger this. A new `bye` message, sent on quit / Leave / tab close /
+end of a one-shot send, tells the other side not to bother reconnecting.
+**Why** — #19 asks to retry failed *chunks*. On a reliable, ordered
+DataChannel individual chunks never fail (SCTP retransmits them); what
+fails is the whole connection. Retrying at that level, with resume,
+recovers from the failures that actually happen without a second
+retransmission layer on top of SCTP.
+**Details** — Without `bye`, an intentional exit looks exactly like a
+crash, and the other side would spend a minute "reconnecting". `bye`
+from a closing browser tab is best-effort (sent on `pagehide`); when it
+doesn't make it, the other side gives up after the 60 s reconnect window.
+Verified by interop tests that cut the browser's connection mid-transfer
+in both directions.
+
+### D51. Occupied rooms don't expire
+*2026-10-19 — #19, revises D3*
+
+**Decision** — The periodic sweep extends the expiry of every room with
+a connected WebSocket by a full TTL. Only rooms nobody is connected to
+expire.
+**Why** — D3's expiry counted from creation, so a session older than 10
+minutes couldn't reconnect after a drop: the room would be gone.
+
+### D52. Adaptive chunk sizing: hill-climb on throughput, capped by the connection
+*2026-10-19 — #21*
+
+**Decision** — Senders start at 16 KiB chunks and double the size while
+throughput, measured over ≥250 ms / ≥512 KiB windows, keeps improving by
+5%; they halve it if a window is 20% slower. Chunks are capped at
+256 KiB and at the connection's maximum message size: the browser reads
+`pc.sctp.maxMessageSize` (64 KiB with aiortc, 256 KiB Chrome↔Chrome);
+the CLI always assumes 64 KiB, aiortc's own limit. No protocol change:
+frames carry byte offsets, so receivers accept any size.
+**Measured** — 100 MB over localhost, each case run twice, against fixed
+16 KiB chunks: browser → CLI 13.2 → 14.0 MB/s, CLI → browser 20.8 →
+21.0 MB/s, browser → browser 35.1 → 35.1 MB/s. **No significant
+difference here**: the bottleneck is aiortc's Python SCTP stack (it
+splits every message into ~1200-byte fragments regardless), not message
+count. A first single-run comparison suggested a 26% regression for
+CLI → browser; repeating it showed that was noise.
+**Why keep it** — #21 asks for it; it's small, bounded and tested on
+both sides, and it can only help where per-message overhead dominates
+(high-bandwidth links between browsers). It must not be described as a
+measured speed-up.
+**Revisit** — The sender measures how fast data is *queued*, which only
+tracks delivery once the 8 MiB ack window (D49) is full; driving it from
+acknowledged bytes would be a better signal.
+
+### D53. Integrity verification is end-to-end SHA-256 (already in place)
+*2026-10-19 — #20*
+
+**Decision** — #20 is satisfied by D17: the sender's SHA-256 of the whole
+file travels in `transfer_complete` and the receiver verifies size and
+hash before the file appears under its final name. With resume (D46)
+the receiver re-hashes its stored prefix and the sender hashes the part
+it skipped, so the check still covers every byte. A mismatch discards
+the partial so a retry starts clean.
+**Why not in `file_metadata`, as #20 suggests** — putting the checksum
+up front would mean reading the whole file before sending its first
+byte (minutes, for a large file). At the end it's computed while
+streaming, for free. Per-chunk checksums would duplicate what DTLS
+(authenticated encryption) and SCTP (CRC32c) already guarantee in
+transit.
+
+### D54. Transfer history: local only, metadata only, easy to turn off
+*2026-10-19 — #22*
+
+**Decision** — Each client records finished transfers on its own
+machine: the CLI in `$XDG_STATE_HOME/whoosh/history.jsonl` (`whoosh
+history`, `--clear`; `WHOOSH_HISTORY_FILE` moves it, `WHOOSH_NO_HISTORY=1`
+disables it; trimmed to 1000 entries), the web client in `localStorage`
+("Recent transfers" on the home page with **Clear**; 200 entries).
+Entries hold time, direction, name, size, outcome and, in the CLI, path
+and verified SHA-256. Received file contents are never kept by history.
+**Why** — #22 requires the server to stay stateless about user data.
+JSON Lines appends cheaply and survives a crash mid-write (a torn last
+line is skipped on read). History is a convenience, so failures to
+write it (full disk, blocked storage) are silent.
+**Note** — The test suite sets `WHOOSH_NO_HISTORY` for everything except
+history's own tests; otherwise the interop tests' CLI processes would
+write into the developer's real history.

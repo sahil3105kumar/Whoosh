@@ -113,6 +113,14 @@ class RoomManager:
         elif len(room.peer_ids) == 1:
             room.state = RoomState.WAITING
 
+    def touch(self, room_id: str, *, now: float | None = None) -> None:
+        """Push a room's expiry a full TTL into the future. Called for rooms
+        with connected peers, so an active session never expires under them
+        (they may need to reconnect long after the room was created)."""
+        room = self._rooms.get(room_id)
+        if room is not None:
+            room.expires_at = (now if now is not None else time.time()) + self._ttl_seconds
+
     def evict_expired(self, *, now: float | None = None) -> int:
         """Evict every expired room and return how many were removed.
 

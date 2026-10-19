@@ -151,3 +151,14 @@ choices that differ from an issue's wording are recorded in
 | #14 Improved transfer queue | `SendQueue` in both clients: ordered, one at a time, removable (D43); CLI `/queue` | `queue.test.ts`, `tests/cli/test_cli.py` |
 | #15 Better CLI experience | Progress bar with speed/ETA, colour (TTY only, `NO_COLOR`), friendly errors, room codes or invite links as arguments, help when run bare (D45) | `tests/cli/test_cli.py` |
 | #16 UI improvements | Latency in the status bar, unread count in the tab title, ETA per transfer, confirm before leaving mid-transfer, **Try again** after a failed connection, invite links accepted in the join box, empty state | interop suite, screenshots |
+
+## v2.0 — Reliable Transfers
+
+| Issue | Implementation | Verified by |
+|---|---|---|
+| #17 Resume interrupted transfers | `resume_key` + `transfer_accept {offset}` (D46); partials on disk (CLI) or in the tab (web) (D47); dead-peer detection (D48) | `tests/transfer/test_resume.py`, `resume.test.ts`, interop: page closed mid-upload / CLI killed mid-send |
+| #18 Chunk acknowledgements | `transfer_ack {offset}` every MiB stored; sender shows acknowledged progress, 8 MiB window, stall after 20 s (D49) | `tests/transfer/test_ack.py`, `ack.test.ts`, interop suite |
+| #19 Retry failed chunks | Automatic reconnect (signaling and P2P) in both clients, interrupted sends retried with resume, `bye` for deliberate exits (D50); occupied rooms never expire (D51) | `tests/cli/test_link.py` (real server, drops in each direction), interop: connection cut mid-transfer both ways |
+| #20 Integrity verification | End-to-end SHA-256 in `transfer_complete`, verified before the file is saved; covers resumed files (D17, D53) | `test_corrupted_chunk_fails_checksum_on_both_sides`, `test_corrupted_partial_fails_then_restarts_clean`, web equivalents |
+| #21 Adaptive chunk sizing | `ChunkSizer` in both senders: 16 KiB → up to 256 KiB while throughput improves, capped by the connection's max message size (D52; no measurable gain on localhost) | `tests/transfer/test_chunking.py`, `chunking.test.ts`, interop suite |
+| #22 Transfer history | CLI: JSON Lines in `$XDG_STATE_HOME/whoosh/`, `whoosh history`; web: localStorage, "Recent transfers" panel (D54) | `tests/cli/test_history.py`, `history.test.ts`, interop (browser ↔ browser) |
