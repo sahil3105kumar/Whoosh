@@ -228,6 +228,8 @@ class Link:
         t = msg.get("type")
         if t == "hello":
             self._peer_id = msg["peer_id"]
+            if msg.get("peers"):
+                self._other_seen = True  # they connected before us
             log.debug("signaling connected (peer_id=%s)", self._peer_id)
             # Back on signaling with the P2P link down: try again now
             if self.is_creator and self._other_seen and not self._connected():

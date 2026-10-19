@@ -195,11 +195,14 @@ async def ws_signaling(
         await websocket.close(code=1008, reason=str(exc))
         return
 
-    # Tell the client their assigned peer_id so they can reconnect later
+    # Tell the client its peer_id (to reconnect later) and who is already
+    # here: peer_joined only reaches peers connected *before* someone joins,
+    # so without this a peer that connects second never hears of the first
     await websocket.send_json(
         {
             "type": "hello",
             "peer_id": assigned_peer_id,
+            "peers": connection_manager.connected_peers(room_id, excluding=assigned_peer_id),
         }
     )
 

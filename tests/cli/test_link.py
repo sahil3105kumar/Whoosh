@@ -116,3 +116,18 @@ async def test_unknown_room_fails_fast(server: str):
     with pytest.raises(ConnectError, match="doesn't exist"):
         await asyncio.wait_for(link.open(), 10)
     await link.close()
+
+
+async def test_joiner_connecting_first_still_works(server: str):
+    """The creator must learn about a peer that arrived before it."""
+    room = await asyncio.to_thread(create_room, server)
+    joiner = Link(server, room, is_creator=False)
+    creator = Link(server, room, is_creator=True)
+    opening = asyncio.create_task(joiner.open())
+    await asyncio.sleep(1.0)  # joiner is in the room first
+    try:
+        a, b = await asyncio.wait_for(asyncio.gather(creator.open(), opening), 30)
+        await _talk(a, b)
+    finally:
+        await creator.close()
+        await joiner.close()

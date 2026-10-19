@@ -138,6 +138,7 @@ interface Signal {
   sdp?: string;
   reason?: string;
   peer_id?: string;
+  peers?: string[];
 }
 
 /**
@@ -288,6 +289,7 @@ export class Link {
     switch (msg.type) {
       case "hello":
         this.peerId = msg.peer_id;
+        if (msg.peers?.length) this.otherSeen = true; // they connected before us
         this.backoffMs = 500;
         if (!this.ready) this.onPhase(this.negotiationStarted ? "connecting" : "waiting");
         // Back on signaling with the P2P link down: try again now

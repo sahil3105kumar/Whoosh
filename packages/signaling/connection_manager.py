@@ -137,6 +137,10 @@ class ConnectionManager:
             except Exception:
                 logger.warning("relay to peer %s in room %s failed", pid, room_id, exc_info=True)
 
+    def connected_peers(self, room_id: str, *, excluding: str) -> list[str]:
+        """Peers in ``room_id`` with a live WebSocket, other than ``excluding``."""
+        return [pid for pid in self._connections.get(room_id, {}) if pid != excluding]
+
     def active_rooms(self) -> list[str]:
         """Rooms with at least one connected WebSocket."""
         return list(self._connections)
