@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import getpass
 import logging
 import os
 import re
@@ -32,7 +33,7 @@ from pathlib import Path
 from websockets.exceptions import WebSocketException
 
 from apps.cli import history
-from apps.cli.connection import ConnectError, Mesh, create_room
+from apps.cli.connection import ConnectError, Mesh, create_room, room_needs_password
 from apps.cli.queue import SendQueue
 from apps.cli.room import Room
 from apps.cli.session import Ui, format_bytes
@@ -48,7 +49,9 @@ Type a message and press Enter to chat with everyone in the room. Commands:
                           (quote paths with spaces)
   /queue                  show the file being sent and those waiting
   /cancel                 cancel current transfers and clear the queue
-  /peers                  list who's in the room
+  /peers                  list who's in the room, and who's verified
+  /verify [NAME [no]]     compare security codes: list them, confirm a match,
+                          or disconnect someone whose code differs
   /ping                   measure round-trip time to everyone
   /quit                   leave"""
 
@@ -153,6 +156,8 @@ def _command(line: str, room: Room, queue: SendQueue, ui: Ui) -> bool:
         room.broadcast(lambda s: s.ping())
     elif cmd == "/peers":
         _show_peers(room, ui)
+    elif cmd == "/verify":
+        _verify(arg.strip(), room, ui)
     elif cmd == "/queue":
         _show_queue(queue, ui)
     elif cmd == "/cancel":
@@ -185,7 +190,29 @@ def _show_peers(room: Room, ui: Ui) -> None:
         return
     for session in room.sessions.values():
         state = "connected" if session.connected.is_set() else "reconnecting"
-        ui.line(f"  {session.peer_name}  {ui.style.dim(state)}")
+        trust = ui.style.ok("verified") if session.verified else "not verified"
+        ui.line(f"  {session.peer_name}  {ui.style.dim(state)}  {trust}")
+        if session.peer_fingerprint:
+            ui.line(ui.style.dim(f"    device {session.peer_fingerprint}"))
+
+
+def _verify(arg: str, room: Room, ui: Ui) -> None:
+    """/verify            list codes still to compare
+    /verify NAME       the codes match
+    /verify NAME no    they don't: disconnect"""
+    if not arg:
+        pending = [s for s in room.sessions.values() if s.sas and not s.verified]
+        if not pending:
+            ui.hint("Everyone here is verified (or nobody is connected).")
+        for s in pending:
+            ui.line(f"  {s.peer_name}:  " + "  ".join(f"{e} {w}" for e, w in s.sas))
+        return
+    name, _, answer = arg.rpartition(" ") if arg.endswith((" no", " yes")) else (arg, "", "")
+    session = room.find(name)
+    if session is None or not session.sas:
+        ui.error(f"Nobody connected is called {name!r}. /peers lists who's here.")
+        return
+    room.verify(session, matches=answer != "no")
 
 
 def _show_queue(queue: SendQueue, ui: Ui) -> None:
@@ -262,19 +289,24 @@ async def _receive_files(room: Room, ui: Ui) -> bool:
 async def _run(args: argparse.Namespace, server: str, ui: Ui) -> bool:
     is_creator = args.cmd in ("create", "send")
 
+    password = _password(args, confirm=is_creator)
     if is_creator:
-        room_id = create_room(server)
+        room_id = create_room(server, password=password)
         joiner = "join" if args.cmd == "create" else "receive"
         ui.line(f"Room created: {ui.style.bold(room_id)}")
         ui.line(f"On the other machine run:  {ui.style.accent(f'whoosh {joiner} {room_id}')}")
         if server != DEFAULT_SERVER:
             ui.hint(f"(or open {server}/#{room_id} in a browser)")
         ui.hint("Waiting for the other person...")
+        if password:
+            ui.hint("The room needs the password you set; share it separately.")
     else:
         room_id = args.room.code
+        if password is None and room_needs_password(server, room_id):
+            password = _ask_password(f"Password for room {room_id}: ")
         ui.hint(f"Joining room {room_id}...")
 
-    mesh = Mesh(server, room_id)
+    mesh = Mesh(server, room_id, password=password)
     out = Path(getattr(args, "out", ".")).expanduser()
     room = Room(mesh, ui, out, args.name)
     await mesh.start()
@@ -296,6 +328,29 @@ async def _run(args: argparse.Namespace, server: str, ui: Ui) -> bool:
         await room.close()
 
 
+_PROMPT = object()  # --password given without a value: ask
+
+
+def _password(args: argparse.Namespace, *, confirm: bool) -> str | None:
+    """The room password from --password / $WHOOSH_PASSWORD, prompting when
+    --password was given bare (#28)."""
+    if args.password is _PROMPT:
+        first = _ask_password("Room password: ")
+        if confirm and _ask_password("Again: ") != first:
+            raise ConnectError("The passwords didn't match.")
+        return first
+    return args.password or os.environ.get("WHOOSH_PASSWORD") or None
+
+
+def _ask_password(prompt: str) -> str:
+    if not sys.stdin.isatty():
+        raise ConnectError("This room needs a password: pass --password or set WHOOSH_PASSWORD.")
+    password = getpass.getpass(prompt)
+    if not password:
+        raise ConnectError("No password given.")
+    return password
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="whoosh",
@@ -310,6 +365,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     p.add_argument("--name", help="Name shown to the other people in the room")
+    p.add_argument(
+        "--password",
+        nargs="?",
+        const=_PROMPT,
+        metavar="PASSWORD",
+        help="Room password: protects a room you create, or opens a protected one. "
+        "Give it without a value to be asked (or set $WHOOSH_PASSWORD).",
+    )
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
 
     out_help = "Directory for received files (default: current directory)"

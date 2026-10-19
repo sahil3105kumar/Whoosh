@@ -2,9 +2,9 @@
 
 export const PROTOCOL_VERSION = 1;
 
-export type MessageType = "hello" | "chat" | "file_metadata" | "transfer_complete" | "transfer_cancel" | "transfer_accept" | "transfer_ack" | "error" | "ping" | "pong" | "bye";
+export type MessageType = "hello" | "chat" | "file_metadata" | "transfer_complete" | "transfer_cancel" | "transfer_accept" | "transfer_ack" | "error" | "ping" | "pong" | "bye" | "key_exchange";
 
-export type Capability = "chat" | "file_transfer" | "cancel" | "resume" | "ack";
+export type Capability = "chat" | "file_transfer" | "cancel" | "resume" | "ack" | "e2e";
 
 /** Capability negotiation sent immediately after the DataChannel opens. */
 export interface HelloPayload {
@@ -71,6 +71,13 @@ export interface PongPayload {
 export interface ByePayload {
 }
 
+/** Sent in the clear (inside DTLS) right after hello: this side's fresh X25519 key, its long-term Ed25519 identity, and a signature binding the two (base64). Everything after it is end-to-end encrypted (D60). */
+export interface KeyExchangePayload {
+  ephemeral: string;
+  identity: string;
+  signature: string;
+}
+
 export interface MessageMap {
   hello: HelloPayload;
   chat: ChatPayload;
@@ -83,6 +90,7 @@ export interface MessageMap {
   ping: PingPayload;
   pong: PongPayload;
   bye: ByePayload;
+  key_exchange: KeyExchangePayload;
 }
 
 export type FieldKind = "string" | "integer" | "number" | "boolean" | "string[]";
@@ -135,5 +143,10 @@ export const PAYLOAD_FIELDS: Record<MessageType, Record<string, FieldSpec>> = {
     timestamp: { kind: "number", optional: false, nullable: false },
   },
   bye: {
+  },
+  key_exchange: {
+    ephemeral: { kind: "string", optional: false, nullable: false },
+    identity: { kind: "string", optional: false, nullable: false },
+    signature: { kind: "string", optional: false, nullable: false },
   },
 };

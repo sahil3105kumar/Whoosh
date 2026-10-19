@@ -9,7 +9,7 @@ export function Home({
   onCreated,
   onJoin,
 }: {
-  onCreated: (roomId: string) => void;
+  onCreated: (roomId: string, password?: string) => void;
   onJoin: (roomId: string) => void;
 }) {
   const [code, setCode] = useState("");
@@ -17,6 +17,7 @@ export function Home({
   const [error, setError] = useState<string>();
 
   const [name, setName] = useState(savedName);
+  const [password, setPassword] = useState("");
   const valid = /^[0-9a-f]{8}$/.test(code);
 
   const saveName = (value: string) => {
@@ -38,7 +39,7 @@ export function Home({
     setCreating(true);
     setError(undefined);
     try {
-      onCreated(await createRoom());
+      onCreated(await createRoom(password || undefined), password || undefined);
     } catch (err) {
       setError((err as Error).message);
       setCreating(false);
@@ -61,6 +62,15 @@ export function Home({
           <Button className="mt-5 w-full" onClick={create} disabled={creating}>
             {creating ? "Creating…" : "Create room"}
           </Button>
+          <input
+            type="password"
+            className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-slate-700 dark:bg-slate-900"
+            placeholder="Password (optional)"
+            value={password}
+            maxLength={256}
+            onChange={(e) => setPassword(e.target.value)}
+            aria-label="Room password (optional)"
+          />
           {error && <p className="mt-3 text-sm text-red-600 dark:text-red-400">{error}</p>}
         </Card>
 

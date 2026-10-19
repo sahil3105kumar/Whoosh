@@ -24,6 +24,7 @@ from apps.cli.connection import (
     PeerGone,
     PeerUnreachable,
 )
+from apps.cli.identity import TrustStore, load_identity
 from apps.cli.session import Session, Ui
 from packages.transfer.manager import Transfer
 
@@ -37,6 +38,9 @@ class Room:
         self._ui = ui
         self._download_dir = download_dir
         self._name = name
+        #: This device's identity and verified devices (#30), loaded once.
+        self._identity = load_identity()
+        self._trust = TrustStore()
         self.sessions: dict[str, Session] = {}
         #: Sessions of peers who have left, kept for their transfer results.
         self._former: list[Session] = []
@@ -116,6 +120,27 @@ class Room:
                 return transfer
         return None
 
+    def find(self, name: str) -> Session | None:
+        """A connected peer by display name."""
+        matches = [s for s in self.sessions.values() if s.peer_name == name]
+        return matches[0] if len(matches) == 1 else None
+
+    def verify(self, session: Session, *, matches: bool) -> None:
+        """The user compared codes with ``session``'s peer (#32)."""
+        if matches:
+            session.mark_verified()
+            self._ui.ok(f"{session.peer_name} is now a verified device.")
+            return
+        self._ui.error(
+            f"The codes didn't match: someone may be intercepting your connection to "
+            f"{session.peer_name}. Disconnecting."
+        )
+        for peer_id, s in list(self.sessions.items()):
+            if s is session:
+                session.refused = True
+                self.mesh.forget(peer_id)
+                self._remove(peer_id, "was disconnected.")
+
     def say_bye(self) -> None:
         self.broadcast(lambda s: s.say_bye())
 
@@ -161,6 +186,8 @@ class Room:
                 on_stall=lambda: self._spawn(self.mesh.drop(peer_id)),
                 name=self._name,
                 peer_id=peer_id,
+                identity=self._identity,
+                trust=self._trust,
             )
             self.sessions[peer_id] = session
             session.start()

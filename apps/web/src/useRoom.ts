@@ -3,7 +3,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { type ConnectPhase, Mesh } from "./lib/connection";
 import { recordTransfer } from "./lib/history";
 import { type QueuedFile, SendQueue } from "./lib/queue";
-import { Session } from "./lib/session";
+import { TrustStore, loadIdentity } from "./lib/identity";
+import { type Security, Session } from "./lib/session";
 import type { Transfer } from "./lib/transfer";
 
 export type Phase = ConnectPhase | "connected" | "reconnecting" | "closed" | "error";
@@ -20,6 +21,8 @@ export interface Peer {
   id: string;
   name: string;
   connected: boolean;
+  /** Encryption and verification state, once the key exchange is done. */
+  security?: Security;
 }
 
 /** A transfer, and who it's with. */
@@ -49,7 +52,7 @@ export function savedName(): string {
 }
 
 /** Everyone in one room, as React state: one Session per peer (#23–#27). */
-export function useRoom(roomId: string) {
+export function useRoom(roomId: string, password?: string) {
   const [meshPhase, setMeshPhase] = useState<ConnectPhase>("signaling");
   const [error, setError] = useState<string>();
   const [log, setLog] = useState<LogEntry[]>([]);
@@ -75,9 +78,16 @@ export function useRoom(roomId: string) {
     const name = savedName();
     let alive = true;
 
+    const trust = new TrustStore();
+    const identity = loadIdentity(); // this device's key, from IndexedDB (#30)
     const updatePeers = () =>
       setPeers(
-        [...sessions].map(([id, s]) => ({ id, name: s.peerName, connected: s.connected })),
+        [...sessions].map(([id, s]) => ({
+          id,
+          name: s.peerName,
+          connected: s.connected,
+          security: s.security,
+        })),
       );
 
     const remove = (peerId: string, why: string) => {
@@ -92,7 +102,8 @@ export function useRoom(roomId: string) {
       updatePeers();
     };
 
-    const createSession = (peerId: string): Session => {
+    const createSession = async (peerId: string): Promise<Session> => {
+      const deviceIdentity = await identity;
       let introduced = false;
       const session: Session = new Session(
         {
@@ -120,13 +131,19 @@ export function useRoom(roomId: string) {
               addLog("system", `Round trip: ${ms.toFixed(1)} ms`);
             }
           },
+          onSecurity: (security) => {
+            if (!security.verified) {
+              addLog("system", `🔒 ${session.peerName}: encrypted. Compare codes to verify.`);
+            }
+            updatePeers();
+          },
           onClosed: () => {
             latencies.delete(peerId);
             updatePeers();
             if (!alive) return;
             if (session.peerLeft) {
               mesh.forget(peerId);
-              remove(peerId, "left.");
+              remove(peerId, session.refused ? "was disconnected." : "left.");
               return;
             }
             // Not a goodbye: the connection dropped. The mesh reconnects (D50)
@@ -143,6 +160,8 @@ export function useRoom(roomId: string) {
         () => mesh.drop(peerId), // a transfer stalled: that connection is dead
         name,
         peerId,
+        deviceIdentity,
+        trust,
       );
       return session;
     };
@@ -152,23 +171,25 @@ export function useRoom(roomId: string) {
       (event) => {
         if (!alive) return;
         switch (event.type) {
-          case "connected": {
+          case "connected":
             clearTimeout(lostTimers.get(event.peerId));
             lostTimers.delete(event.peerId);
-            let session = sessions.get(event.peerId);
-            const reconnect = session !== undefined;
-            if (!session) {
-              session = createSession(event.peerId);
-              sessions.set(event.peerId, session);
-            }
-            session.attach(event.channel);
-            if (reconnect) addLog("system", `Reconnected to ${session.peerName}.`);
-            setEverConnected(true);
-            setError(undefined);
-            updatePeers();
-            session.ping();
+            void (async () => {
+              let session = sessions.get(event.peerId);
+              const reconnect = session !== undefined;
+              if (!session) {
+                session = await createSession(event.peerId);
+                if (!alive) return;
+                sessions.set(event.peerId, session);
+              }
+              await session.attach(event.channel);
+              if (reconnect) addLog("system", `Reconnected to ${session.peerName}.`);
+              setEverConnected(true);
+              setError(undefined);
+              updatePeers();
+              session.ping();
+            })();
             break;
-          }
           case "gone":
             remove(event.peerId, "left the room.");
             break;
@@ -181,6 +202,7 @@ export function useRoom(roomId: string) {
         }
       },
       setMeshPhase,
+      password,
     );
 
     // Each file goes to everyone connected, in parallel (#27); interrupted
@@ -232,7 +254,7 @@ export function useRoom(roomId: string) {
         mesh.close();
       }, 100);
     };
-  }, [roomId, addLog]);
+  }, [roomId, password, addLog]);
 
   const sendChat = useCallback(
     (text: string) => {
@@ -263,6 +285,24 @@ export function useRoom(roomId: string) {
     for (const s of sessionsRef.current.values()) if (s.connected) s.ping();
   }, []);
 
+  /** The user compared codes with a peer (#32): trust it, or cut it off. */
+  const verify = useCallback(
+    (peerId: string, matches: boolean) => {
+      const session = sessionsRef.current.get(peerId);
+      if (!session) return;
+      if (matches) {
+        session.markVerified();
+        addLog("system", `${session.peerName} is now a verified device.`);
+      } else {
+        session.refuse(
+          `The codes didn't match: someone may be intercepting your connection to ` +
+            `${session.peerName}. Disconnected.`,
+        );
+      }
+    },
+    [addLog],
+  );
+
   const anyConnected = peers.some((p) => p.connected);
   const phase: Phase =
     error && !everConnected
@@ -291,5 +331,6 @@ export function useRoom(roomId: string) {
     unqueue,
     cancel,
     ping,
+    verify,
   };
 }

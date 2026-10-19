@@ -56,3 +56,33 @@ def test_config_returns_ice_servers():
     assert response.status_code == 200
     ice_servers = response.json()["ice_servers"]
     assert ice_servers and all(url.startswith("stun:") for url in ice_servers[0]["urls"])
+
+
+def test_config_includes_turn_credentials(monkeypatch):
+    import base64
+    import hashlib
+    import hmac
+
+    from apps.server import main
+    from apps.server.config import Settings
+
+    monkeypatch.setattr(
+        main,
+        "settings",
+        Settings(turn_urls=("turn:turn.example:3478",), turn_secret="shh", turn_ttl_seconds=600),
+    )
+    turn = client.get("/config").json()["ice_servers"][-1]
+
+    assert turn["urls"] == ["turn:turn.example:3478"]
+    expiry = int(turn["username"].split(":")[0])
+    assert 0 < expiry - __import__("time").time() <= 600
+    expected = base64.b64encode(
+        hmac.new(b"shh", turn["username"].encode(), hashlib.sha1).digest()
+    ).decode()
+    assert turn["credential"] == expected
+    assert "shh" not in client.get("/config").text  # the secret itself never leaves
+
+
+def test_config_without_turn_has_only_stun():
+    servers = client.get("/config").json()["ice_servers"]
+    assert all("username" not in s or s["username"] is None for s in servers)

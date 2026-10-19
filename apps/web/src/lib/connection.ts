@@ -22,17 +22,49 @@ export type ConnectPhase = "signaling" | "waiting" | "connecting";
 
 // ── HTTP ────────────────────────────────────────────────────────────
 
-export async function createRoom(): Promise<string> {
-  const resp = await fetch("/rooms", { method: "POST" });
+export async function createRoom(password?: string): Promise<string> {
+  const resp = await fetch("/rooms", {
+    method: "POST",
+    ...(password
+      ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password }) }
+      : {}),
+  });
   if (resp.status === 429) throw new ConnectError("Too many rooms created. Wait a minute.");
   if (!resp.ok) throw new ConnectError(`Couldn't create a room (HTTP ${resp.status}).`);
   return ((await resp.json()) as { room_id: string }).room_id;
 }
 
-async function fetchIceServers(): Promise<RTCIceServer[]> {
+/** Whether joining `roomId` needs a password (#28). Throws ConnectError if
+ * the room doesn't exist. */
+export async function roomNeedsPassword(roomId: string): Promise<boolean> {
+  const resp = await fetch(`/rooms/${encodeURIComponent(roomId)}`);
+  if (resp.status === 404) throw new ConnectError(explainClose("No such room", roomId));
+  if (!resp.ok) throw new ConnectError(`Couldn't look up the room (HTTP ${resp.status}).`);
+  return ((await resp.json()) as { password_required?: boolean }).password_required ?? false;
+}
+
+interface IceConfig {
+  iceServers: RTCIceServer[];
+  iceTransportPolicy: RTCIceTransportPolicy;
+}
+
+/** ICE servers (STUN, and TURN with short-lived credentials, #31) and
+ * whether to use only the relay. */
+async function fetchIceConfig(): Promise<IceConfig> {
   const resp = await fetch("/config");
   if (!resp.ok) throw new ConnectError(`Couldn't load server config (HTTP ${resp.status}).`);
-  return ((await resp.json()) as { ice_servers: RTCIceServer[] }).ice_servers;
+  const config = (await resp.json()) as {
+    ice_servers: { urls: string[]; username?: string | null; credential?: string | null }[];
+    ice_transport_policy?: string;
+  };
+  return {
+    iceServers: config.ice_servers.map(({ urls, username, credential }) => ({
+      urls,
+      ...(username ? { username } : {}),
+      ...(credential ? { credential } : {}),
+    })),
+    iceTransportPolicy: config.ice_transport_policy === "relay" ? "relay" : "all",
+  };
 }
 
 // ── DataChannel adapter ─────────────────────────────────────────────
@@ -133,6 +165,8 @@ export function explainClose(reason: string, roomId: string): string {
   }
   if (reason.startsWith("Room expired")) return `Room ${roomId} has expired. Ask for a new code.`;
   if (reason.startsWith("Room is full")) return `Room ${roomId} is full.`;
+  if (reason.startsWith("Wrong password")) return `Wrong password for room ${roomId}.`;
+  if (reason.startsWith("This room needs a password")) return `Room ${roomId} needs a password.`;
   return reason;
 }
 
@@ -178,7 +212,7 @@ interface Pair {
  */
 export class Mesh {
   peerId?: string;
-  private iceServers: RTCIceServer[] = [];
+  private ice: IceConfig = { iceServers: [], iceTransportPolicy: "all" };
   private ws?: WebSocket;
   private pairs = new Map<string, Pair>();
   private forgotten = new Set<string>();
@@ -189,10 +223,11 @@ export class Mesh {
     readonly roomId: string,
     private readonly onEvent: (event: MeshEvent) => void,
     private readonly onPhase: (phase: ConnectPhase) => void = () => {},
+    private readonly password?: string,
   ) {}
 
   async start(signal: AbortSignal): Promise<void> {
-    this.iceServers = await fetchIceServers();
+    this.ice = await fetchIceConfig();
     // Bail before opening the socket: a cancelled attempt that reached the
     // server would hold a room slot (React StrictMode runs effects twice).
     if (signal.aborted) throw new ConnectError("Cancelled.");
@@ -238,6 +273,11 @@ export class Mesh {
       `${scheme}://${location.host}/rooms/${encodeURIComponent(this.roomId)}/ws${query}`,
     );
     this.ws = ws;
+    if (this.password) {
+      // Protected room: the first message must authenticate (#28)
+      const password = this.password;
+      ws.addEventListener("open", () => ws.send(JSON.stringify({ type: "auth", password })));
+    }
     ws.addEventListener("message", (event) => {
       let msg: Signal;
       try {
@@ -355,7 +395,7 @@ export class Mesh {
   private newPeer(pair: Pair): RTCPeerConnection {
     pair.pc?.close();
     pair.ready = undefined;
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    const pc = new RTCPeerConnection(this.ice);
     pair.pc = pc;
     return pc;
   }
@@ -418,7 +458,7 @@ function connected(pair: Pair): boolean {
 
 const directFailedMessage =
   "Direct connection failed: no network path between the peers. One side is likely " +
-  "behind a strict NAT or firewall (relay servers aren't supported yet).";
+  "behind a strict NAT or firewall, and the server's TURN relay is missing or unreachable.";
 
 /** Resolve when ICE gathering completes, or after GATHER_TIMEOUT_MS with
  * whatever candidates were found by then. */

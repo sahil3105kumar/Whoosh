@@ -116,6 +116,12 @@ three people). Pick a display name with `--name`.
 
 `whoosh history` lists past transfers (kept only on your machine).
 
+Everything is end-to-end encrypted. To be sure nobody is in the middle
+(not even the server), compare the 6 emoji each side shows — `/verify`
+in the CLI, **Verify** in the browser — once per device. Rooms can have a
+password (`--password`), and a TURN relay can be enabled for networks
+that block direct connections (see [deployment](docs/deployment.md)).
+
 Interrupted transfers resume where they stopped, and a dropped
 connection is re-established automatically.
 
@@ -154,6 +160,13 @@ Deploy with Docker; see [docs/deployment.md](docs/deployment.md).
 * [Deployment](docs/deployment.md)
 
 ## Roadmap
+
+### Done
+
+v1.0 (MVP), v1.1 (usability), v2.0 (reliable transfers), v3.0
+(multi-peer rooms) and v4.0 (security). See
+[docs/architecture/roadmap.md](docs/architecture/roadmap.md) for what each
+issue became, and [docs/decisions.md](docs/decisions.md) for why.
 
 ### v1.0
 

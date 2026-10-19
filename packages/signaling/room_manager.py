@@ -6,6 +6,7 @@ import time
 from .enums import RoomState
 from .exceptions import RoomExpiredError, RoomFullError, RoomNotFoundError
 from .models import Room
+from .passwords import PasswordHash
 
 #: How long a room lives before it's considered expired if nobody's acted on it.
 #: Chosen to comfortably cover "create a room, share the code, other person joins"
@@ -42,8 +43,9 @@ class RoomManager:
         self._rooms: dict[str, Room] = {}
         self._ttl_seconds = ttl_seconds
 
-    def create_room(self) -> Room:
+    def create_room(self, *, password: str | None = None) -> Room:
         """Create a new room in RoomState.CREATED and register it.
+        With ``password``, joining it requires that password (#28).
 
         Retries on the (astronomically unlikely) chance of a room_id
         collision rather than assuming uniqueness.
@@ -58,6 +60,7 @@ class RoomManager:
             state=RoomState.CREATED,
             created_at=now,
             expires_at=now + self._ttl_seconds,
+            password=PasswordHash.create(password) if password else None,
         )
         self._rooms[room_id] = room
         return room

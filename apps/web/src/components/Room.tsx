@@ -1,5 +1,6 @@
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
+import { roomNeedsPassword } from "../lib/connection";
 import type { QueuedFile } from "../lib/queue";
 import { type LogEntry, type Peer, type PeerTransfer, type Phase, useRoom } from "../useRoom";
 import { Button, Card, formatBytes } from "./ui";
@@ -14,17 +15,112 @@ const phaseText: Record<Phase, string> = {
   error: "Couldn't connect",
 };
 
+/**
+ * A room screen. Protected rooms (#28) first ask for the password, unless
+ * this browser just created the room and already knows it.
+ */
 export function Room({
   roomId,
+  password: knownPassword,
   onLeave,
   onRetry,
 }: {
   roomId: string;
+  password?: string;
   onLeave: () => void;
   onRetry: () => void;
 }) {
-  const room = useRoom(roomId);
+  const [password, setPassword] = useState(knownPassword);
+  const [needsPassword, setNeedsPassword] = useState<boolean>();
+  const [lookupError, setLookupError] = useState<string>();
+
+  useEffect(() => {
+    if (knownPassword) return;
+    let current = true;
+    roomNeedsPassword(roomId)
+      .then((needs) => current && setNeedsPassword(needs))
+      .catch((err: unknown) => current && setLookupError((err as Error).message));
+    return () => {
+      current = false;
+    };
+  }, [roomId, knownPassword]);
+
+  if (lookupError) {
+    return (
+      <Card>
+        <p className="font-medium">Couldn't join</p>
+        <p className="mt-1 text-sm text-red-600 dark:text-red-400" role="alert">
+          {lookupError}
+        </p>
+        <Button variant="secondary" className="mt-4" onClick={onLeave}>
+          Back
+        </Button>
+      </Card>
+    );
+  }
+  if (!knownPassword && needsPassword === undefined) {
+    return <Card>Looking up the room…</Card>;
+  }
+  if (needsPassword && !password) {
+    return <PasswordPrompt roomId={roomId} onSubmit={setPassword} onCancel={onLeave} />;
+  }
+  return <RoomView roomId={roomId} password={password} onLeave={onLeave} onRetry={onRetry} />;
+}
+
+function PasswordPrompt({
+  roomId,
+  onSubmit,
+  onCancel,
+}: {
+  roomId: string;
+  onSubmit: (password: string) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState("");
+  return (
+    <Card>
+      <h2 className="font-medium">Room {roomId} needs a password</h2>
+      <form
+        className="mt-4 flex flex-col gap-2 sm:flex-row"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (value) onSubmit(value);
+        }}
+      >
+        <input
+          type="password"
+          autoFocus
+          className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-slate-700 dark:bg-slate-900"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          aria-label="Room password"
+        />
+        <Button type="submit" disabled={!value}>
+          Join
+        </Button>
+        <Button type="button" variant="secondary" onClick={onCancel}>
+          Cancel
+        </Button>
+      </form>
+    </Card>
+  );
+}
+
+function RoomView({
+  roomId,
+  password,
+  onLeave,
+  onRetry,
+}: {
+  roomId: string;
+  password?: string;
+  onLeave: () => void;
+  onRetry: () => void;
+}) {
+  const room = useRoom(roomId, password);
   const [inviting, setInviting] = useState(false);
+  const [verifying, setVerifying] = useState<string>();
+  const verifyingPeer = room.peers.find((p) => p.id === verifying);
   const live = room.phase === "connected";
   const canSend = live && room.peerReady;
   const dragging = usePageDrop(canSend, room.sendFiles);
@@ -73,13 +169,24 @@ export function Room({
         <Button variant="secondary" onClick={leave}>
           Leave
         </Button>
-        {room.peers.length > 0 && <PeerList peers={room.peers} />}
+        {room.peers.length > 0 && <PeerList peers={room.peers} onVerify={setVerifying} />}
         {room.error && (
           <p className="w-full text-sm text-red-600 dark:text-red-400" role="alert">
             {room.error}
           </p>
         )}
       </Card>
+
+      {verifyingPeer?.security && (
+        <VerifyDialog
+          peer={verifyingPeer}
+          onAnswer={(matches) => {
+            room.verify(verifyingPeer.id, matches);
+            setVerifying(undefined);
+          }}
+          onClose={() => setVerifying(undefined)}
+        />
+      )}
 
       {(room.phase === "waiting" || inviting) && <ShareBox roomId={roomId} />}
 
@@ -180,24 +287,101 @@ function useWarnBeforeUnload(active: boolean): void {
   }, [active]);
 }
 
-/** Who's in the room (#26). */
-function PeerList({ peers }: { peers: Peer[] }) {
+/** Who's in the room (#26), and whether each is verified (#30, #32). */
+function PeerList({ peers, onVerify }: { peers: Peer[]; onVerify: (peerId: string) => void }) {
   return (
     <ul className="flex w-full flex-wrap gap-2" aria-label="People in the room">
       {peers.map((p) => (
         <li
           key={p.id}
-          className="flex items-center gap-1.5 rounded-full bg-slate-100 px-2.5 py-0.5 text-xs dark:bg-slate-800"
+          className={`flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs ${
+            p.security?.impostorWarning
+              ? "bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-200"
+              : "bg-slate-100 dark:bg-slate-800"
+          }`}
           title={p.connected ? "Connected" : "Reconnecting"}
         >
           <span
             className={`size-1.5 rounded-full ${p.connected ? "bg-emerald-500" : "animate-pulse bg-amber-400"}`}
             aria-hidden
           />
+          {p.security && <span title="End-to-end encrypted">🔒</span>}
           {p.name}
+          {p.security?.verified && (
+            <span className="text-emerald-600 dark:text-emerald-400" title="Verified device">
+              ✓
+            </span>
+          )}
+          {p.security && !p.security.verified && (
+            <button
+              className="ml-0.5 font-medium text-sky-700 hover:underline dark:text-sky-400"
+              onClick={() => onVerify(p.id)}
+            >
+              Verify
+            </button>
+          )}
         </li>
       ))}
     </ul>
+  );
+}
+
+/** Compare security codes with one peer (#32). */
+function VerifyDialog({
+  peer,
+  onAnswer,
+  onClose,
+}: {
+  peer: Peer;
+  onAnswer: (matches: boolean) => void;
+  onClose: () => void;
+}) {
+  const security = peer.security!;
+  return (
+    <div
+      className="fixed inset-0 z-20 flex items-center justify-center bg-slate-900/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        role="dialog"
+        aria-label={`Verify ${peer.name}`}
+        className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl dark:bg-slate-900"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="font-medium">Verify {peer.name}</h2>
+        {security.impostorWarning && (
+          <p className="mt-2 rounded-lg bg-red-50 p-2 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
+            This isn't the device you verified as {peer.name} before.
+          </p>
+        )}
+        <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">
+          Ask {peer.name} what their screen shows for you — in person or on a call, not in this
+          chat. If the symbols match, nobody is intercepting your connection.
+        </p>
+        <ol className="mt-4 grid grid-cols-3 gap-3 text-center" aria-label="Security code">
+          {security.sas.map(([emoji, word], i) => (
+            <li key={i} className="rounded-lg bg-slate-100 py-2 dark:bg-slate-800">
+              <div className="text-3xl" aria-hidden>
+                {emoji}
+              </div>
+              <div className="text-xs text-slate-600 dark:text-slate-400">{word}</div>
+            </li>
+          ))}
+        </ol>
+        <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
+          Device {security.fingerprint}
+        </p>
+        <div className="mt-5 flex flex-wrap gap-2">
+          <Button onClick={() => onAnswer(true)}>They match</Button>
+          <Button variant="secondary" onClick={() => onAnswer(false)}>
+            They don't match
+          </Button>
+          <Button variant="ghost" onClick={onClose}>
+            Later
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }
 

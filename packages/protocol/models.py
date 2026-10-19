@@ -109,6 +109,16 @@ class PongPayload(Payload):
     timestamp: float
 
 
+class KeyExchangePayload(Payload):
+    """Sent in the clear (inside DTLS) right after hello: this side's fresh
+    X25519 key, its long-term Ed25519 identity, and a signature binding the
+    two (base64). Everything after it is end-to-end encrypted (D60)."""
+
+    ephemeral: str
+    identity: str
+    signature: str
+
+
 class ByePayload(Payload):
     """Sent just before leaving on purpose, so the other side ends the
     session instead of trying to reconnect (docs/decisions.md D50)."""
@@ -129,7 +139,8 @@ AnyPayload = Annotated[
     | ErrorPayload
     | PingPayload
     | PongPayload
-    | ByePayload,
+    | ByePayload
+    | KeyExchangePayload,
     Field(discriminator=None),
 ]
 

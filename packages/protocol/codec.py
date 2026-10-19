@@ -24,6 +24,7 @@ from packages.protocol.models import (
     ErrorPayload,
     FileMetadataPayload,
     HelloPayload,
+    KeyExchangePayload,
     Payload,
     PingPayload,
     PongPayload,
@@ -47,6 +48,7 @@ PAYLOAD_REGISTRY: dict[MessageType, type[Payload]] = {
     MessageType.PING: PingPayload,
     MessageType.PONG: PongPayload,
     MessageType.BYE: ByePayload,
+    MessageType.KEY_EXCHANGE: KeyExchangePayload,
 }
 
 

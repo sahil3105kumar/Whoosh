@@ -1158,6 +1158,7 @@ dependencies = [
 [package.optional-dependencies]
 cli = [
     { name = "aiortc" },
+    { name = "cryptography" },
     { name = "websockets" },
 ]
 server = [
@@ -1184,6 +1185,7 @@ interop = [
 [package.metadata]
 requires-dist = [
     { name = "aiortc", marker = "extra == 'cli'", specifier = ">=1.15.0" },
+    { name = "cryptography", marker = "extra == 'cli'", specifier = ">=45.0" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.141.0" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.30.0" },

@@ -267,3 +267,70 @@ async def test_addressed_signaling_reaches_only_its_target():
             # c got nothing addressed to b
             await a.send_json({"type": "offer", "sdp": "for-c-probe", "to": b_id})
             assert (await b.receive_json())["sdp"] == "for-c-probe"
+
+
+# ── Password-protected rooms (#28) ──────────────────────────────────
+
+
+async def _create_protected_room(password: str) -> str:
+    async with _http_client() as client:
+        resp = await client.post("/rooms", json={"password": password})
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body["password_required"] is True
+        assert password not in resp.text  # never echoed
+        return body["room_id"]
+
+
+async def _close_reason(room_id: str, first_message: dict | None) -> str | None:
+    """Connect, optionally send a first message; the close reason, or None
+    if we got in (received hello)."""
+    from httpx_ws import WebSocketDisconnect
+
+    async with _http_client() as client:
+        try:
+            async with aconnect_ws(f"/rooms/{room_id}/ws", client) as ws:
+                if first_message is not None:
+                    await ws.send_json(first_message)
+                msg = await ws.receive_json()
+                assert msg["type"] == "hello"
+                return None
+        except WebSocketDisconnect as exc:
+            return exc.reason
+        except ExceptionGroup as group:
+            excs = group.exceptions
+            while excs and isinstance(excs[0], ExceptionGroup):
+                excs = excs[0].exceptions
+            assert isinstance(excs[0], WebSocketDisconnect)
+            return excs[0].reason
+
+
+async def test_protected_room_requires_the_password():
+    room_id = await _create_protected_room("s3cret")
+
+    assert await _close_reason(room_id, {"type": "offer", "sdp": "x"}) == (
+        "This room needs a password"
+    )
+    assert await _close_reason(room_id, {"type": "auth", "password": "nope"}) == "Wrong password"
+    assert await _close_reason(room_id, {"type": "auth", "password": "s3cret"}) is None
+
+
+async def test_lookup_reports_protection():
+    room_id = await _create_protected_room("s3cret")
+    async with _http_client() as client:
+        assert (await client.get(f"/rooms/{room_id}")).json()["password_required"] is True
+        open_room = (await client.post("/rooms")).json()
+        assert open_room["password_required"] is False
+
+
+async def test_password_guessing_is_rate_limited():
+    room_id = await _create_protected_room("s3cret")
+    for _ in range(5):
+        assert await _close_reason(room_id, {"type": "auth", "password": "x"}) == "Wrong password"
+    reason = await _close_reason(room_id, {"type": "auth", "password": "s3cret"})
+    assert reason == "Too many wrong passwords; wait a minute"
+
+
+async def test_unprotected_rooms_need_no_auth():
+    room_id = await _create_room()
+    assert await _close_reason(room_id, None) is None

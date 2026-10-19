@@ -63,11 +63,21 @@ def explain_close(reason: str, room_id: str) -> str:
         return f"Room {room_id} has expired. Ask for a new code."
     if reason.startswith("Room is full"):
         return f"Room {room_id} is full."
+    if reason.startswith("Wrong password"):
+        return f"Wrong password for room {room_id}."
+    if reason.startswith("This room needs a password"):
+        return f"Room {room_id} needs a password (--password)."
     return reason
 
 
-def create_room(server: str) -> str:
-    req = urllib.request.Request(f"{server}/rooms", method="POST")
+def create_room(server: str, *, password: str | None = None) -> str:
+    body = json.dumps({"password": password}).encode() if password else None
+    req = urllib.request.Request(
+        f"{server}/rooms",
+        method="POST",
+        data=body,
+        headers={"Content-Type": "application/json"} if body else {},
+    )
     try:
         with urllib.request.urlopen(req) as resp:
             room_id: str = json.loads(resp.read())["room_id"]
@@ -80,16 +90,36 @@ def create_room(server: str) -> str:
     return room_id
 
 
+def room_needs_password(server: str, room_id: str) -> bool:
+    """Look a room up: whether joining needs a password. Raises ConnectError
+    if it doesn't exist."""
+    try:
+        with urllib.request.urlopen(f"{server}/rooms/{room_id}") as resp:
+            return bool(json.loads(resp.read()).get("password_required"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise ConnectError(explain_close("No such room", room_id)) from exc
+        raise
+
+
 def _fetch_rtc_config(server: str) -> RTCConfiguration:
     with urllib.request.urlopen(f"{server}/config") as resp:
         ice_servers = json.loads(resp.read())["ice_servers"]
-    return RTCConfiguration(iceServers=[RTCIceServer(urls=s["urls"]) for s in ice_servers])
+    # TURN entries carry short-lived credentials (#31); aiortc can't be forced
+    # to relay-only, so the server's ice_transport_policy only applies to
+    # browsers
+    return RTCConfiguration(
+        iceServers=[
+            RTCIceServer(urls=s["urls"], username=s.get("username"), credential=s.get("credential"))
+            for s in ice_servers
+        ]
+    )
 
 
 DIRECT_FAILED = (
     "Direct connection failed: no network path between the peers. "
-    "One side is likely behind a strict NAT or firewall "
-    "(relay servers aren't supported yet)."
+    "One side is likely behind a strict NAT or firewall, and the server's "
+    "TURN relay is missing or unreachable."
 )
 
 
@@ -149,9 +179,10 @@ class _Pair:
 
 
 class Mesh:
-    def __init__(self, server: str, room_id: str) -> None:
+    def __init__(self, server: str, room_id: str, *, password: str | None = None) -> None:
         self.server = server
         self.room_id = room_id
+        self._password = password
         self.events: asyncio.Queue[MeshEvent] = asyncio.Queue()
         self._ws_url = f"{server.replace('http', 'ws', 1)}/rooms/{room_id}/ws"
         self._rtc_config: RTCConfiguration | None = None
@@ -216,6 +247,9 @@ class Mesh:
             reason, code = "", None
             try:
                 async with websockets.connect(url) as ws:
+                    if self._password is not None:
+                        # Protected room: the first message must authenticate
+                        await ws.send(json.dumps({"type": "auth", "password": self._password}))
                     self._ws = ws
                     backoff = 0.5
                     async for raw in ws:

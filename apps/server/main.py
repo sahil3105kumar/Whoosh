@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -11,7 +15,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from apps.server.config import Settings
 from apps.server.rate_limit import RateLimiter
@@ -21,6 +25,8 @@ from packages.signaling.exceptions import (
     RoomFullError,
     RoomNotFoundError,
 )
+from packages.signaling.models import Room
+from packages.signaling.passwords import MAX_LENGTH as MAX_PASSWORD_LENGTH
 from packages.signaling.room_manager import RoomManager
 
 logger = logging.getLogger(__name__)
@@ -44,6 +50,11 @@ connection_manager = ConnectionManager(
     room_manager, reconnect_grace_seconds=settings.reconnect_grace_seconds
 )
 room_create_limiter = RateLimiter(settings.room_create_per_minute)
+#: Password guesses per room per client address (#28).
+password_attempts = RateLimiter(5)
+
+#: How long a protected room waits for the auth message.
+_AUTH_TIMEOUT_SECONDS = 10.0
 
 
 async def _sweep_expired_rooms() -> None:
@@ -54,6 +65,7 @@ async def _sweep_expired_rooms() -> None:
             room_manager.touch(room_id)
         evicted = room_manager.evict_expired()
         room_create_limiter.prune()
+        password_attempts.prune()
         if evicted:
             logger.info("evicted %d expired room(s)", evicted)
 
@@ -80,32 +92,45 @@ if settings.allowed_origins:
     )
 
 
+class CreateRoomRequest(BaseModel):
+    #: Optional: joining then requires it (#28).
+    password: str | None = Field(default=None, min_length=1, max_length=MAX_PASSWORD_LENGTH)
+
+
 class CreateRoomResponse(BaseModel):
     room_id: str
     state: str
     created_at: float
     expires_at: float
+    password_required: bool = False
 
 
 @app.post("/rooms", response_model=CreateRoomResponse, status_code=201)
-async def create_room(request: Request) -> CreateRoomResponse:
+async def create_room(
+    request: Request, body: CreateRoomRequest | None = None
+) -> CreateRoomResponse:
     """Create a new signaling room.
 
-    No request body: room creation takes no parameters in v1.0 (no
-    auth, no room naming — see docs/vision.md: "no accounts or
-    authentication"). Returns the room_id the creator shares with
-    whoever they want to connect with.
+    The body is optional: ``{"password": "..."}`` makes the room require
+    that password to join (#28). Still no accounts (docs/vision.md).
+    Returns the room_id the creator shares with whoever they want to
+    connect with.
     """
     client_ip = request.client.host if request.client else "unknown"
     if not room_create_limiter.allow(client_ip):
         raise HTTPException(status_code=429, detail="too many rooms created, slow down")
 
-    room = room_manager.create_room()
+    room = room_manager.create_room(password=body.password if body else None)
+    return _room_response(room)
+
+
+def _room_response(room: Room) -> CreateRoomResponse:
     return CreateRoomResponse(
         room_id=room.id,
         state=str(room.state),
         created_at=room.created_at,
         expires_at=room.expires_at,
+        password_required=room.protected,
     )
 
 
@@ -128,12 +153,7 @@ async def get_room(room_id: str) -> CreateRoomResponse:
     except RoomExpiredError as exc:
         raise HTTPException(status_code=404, detail="room expired") from exc
 
-    return CreateRoomResponse(
-        room_id=room.id,
-        state=str(room.state),
-        created_at=room.created_at,
-        expires_at=room.expires_at,
-    )
+    return _room_response(room)
 
 
 class _CloseConnection(Exception):
@@ -166,6 +186,29 @@ async def _receive_signal(websocket: WebSocket) -> dict[str, Any]:
     return data
 
 
+async def _check_password(websocket: WebSocket, room_id: str) -> str | None:
+    """None if this socket may join; otherwise why not."""
+    try:
+        room = room_manager.get_room(room_id)
+    except (RoomNotFoundError, RoomExpiredError):
+        return None  # connect() reports these with their own reasons
+    if room.password is None:
+        return None
+    try:
+        msg = await asyncio.wait_for(_receive_signal(websocket), _AUTH_TIMEOUT_SECONDS)
+    except (TimeoutError, WebSocketDisconnect, _CloseConnection):
+        return "This room needs a password"
+    password = msg.get("password")
+    if msg.get("type") != "auth" or not isinstance(password, str):
+        return "This room needs a password"
+    client = websocket.client.host if websocket.client else "unknown"
+    if not password_attempts.allow(f"{room_id}:{client}"):
+        return "Too many wrong passwords; wait a minute"
+    if not room.password.matches(password[:MAX_PASSWORD_LENGTH]):
+        return "Wrong password"
+    return None
+
+
 @app.websocket("/rooms/{room_id}/ws")
 async def ws_signaling(
     websocket: WebSocket,
@@ -187,6 +230,13 @@ async def ws_signaling(
 
     if not settings.origin_allowed(websocket.headers.get("origin")):
         await websocket.close(code=1008, reason="origin not allowed")
+        return
+
+    # Password-protected rooms (#28): the first message must be
+    # {"type": "auth", "password": ...}, sent on every (re)connect. Never in
+    # the URL, which would end up in logs.
+    if (refusal := await _check_password(websocket, room_id)) is not None:
+        await websocket.close(code=1008, reason=refusal)
         return
 
     try:
@@ -239,10 +289,13 @@ class IceServer(BaseModel):
     """Same shape as the browser's RTCIceServer dictionary."""
 
     urls: list[str]
+    username: str | None = None
+    credential: str | None = None
 
 
 class ClientConfigResponse(BaseModel):
     ice_servers: list[IceServer]
+    ice_transport_policy: str = "all"
 
 
 @app.get("/config")
@@ -253,7 +306,25 @@ async def client_config() -> ClientConfigResponse:
     client) means adding TURN later is a server config change only.
     """
     ice_servers = [IceServer(urls=list(settings.stun_urls))] if settings.stun_urls else []
-    return ClientConfigResponse(ice_servers=ice_servers)
+    if settings.turn_urls and settings.turn_secret:
+        username, credential = turn_credentials(settings.turn_secret, settings.turn_ttl_seconds)
+        ice_servers.append(
+            IceServer(urls=list(settings.turn_urls), username=username, credential=credential)
+        )
+    return ClientConfigResponse(
+        ice_servers=ice_servers, ice_transport_policy=settings.ice_transport_policy
+    )
+
+
+def turn_credentials(secret: str, ttl_seconds: int, *, now: float | None = None) -> tuple[str, str]:
+    """Short-lived TURN credentials (the "TURN REST API" scheme coturn
+    implements with use-auth-secret): username is the expiry timestamp,
+    credential is base64(HMAC-SHA1(secret, username)). The TURN server
+    checks them with the same secret; clients never see it (D59)."""
+    expiry = int((now if now is not None else time.time()) + ttl_seconds)
+    username = f"{expiry}:{secrets.token_hex(4)}"
+    digest = hmac.new(secret.encode(), username.encode(), hashlib.sha1).digest()
+    return username, base64.b64encode(digest).decode()
 
 
 @app.get("/healthz")
