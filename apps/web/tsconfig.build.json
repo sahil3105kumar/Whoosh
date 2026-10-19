@@ -1,0 +1,7 @@
+{
+  // Production builds type-check the app only; tests (which may read
+  // fixtures from outside apps/web, e.g. tests/vectors) are checked by
+  // `npm run typecheck` in CI.
+  "extends": "./tsconfig.json",
+  "exclude": ["src/**/*.test.ts"]
+}

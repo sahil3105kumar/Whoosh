@@ -49,7 +49,9 @@ Type a message and press Enter to chat with everyone in the room. Commands:
                           (quote paths with spaces)
   /queue                  show the file being sent and those waiting
   /cancel                 cancel current transfers and clear the queue
-  /peers                  list who's in the room
+  /peers                  list who's in the room, and who's verified
+  /verify [NAME [no]]     compare security codes: list them, confirm a match,
+                          or disconnect someone whose code differs
   /ping                   measure round-trip time to everyone
   /quit                   leave"""
 
@@ -154,6 +156,8 @@ def _command(line: str, room: Room, queue: SendQueue, ui: Ui) -> bool:
         room.broadcast(lambda s: s.ping())
     elif cmd == "/peers":
         _show_peers(room, ui)
+    elif cmd == "/verify":
+        _verify(arg.strip(), room, ui)
     elif cmd == "/queue":
         _show_queue(queue, ui)
     elif cmd == "/cancel":
@@ -186,7 +190,29 @@ def _show_peers(room: Room, ui: Ui) -> None:
         return
     for session in room.sessions.values():
         state = "connected" if session.connected.is_set() else "reconnecting"
-        ui.line(f"  {session.peer_name}  {ui.style.dim(state)}")
+        trust = ui.style.ok("verified") if session.verified else "not verified"
+        ui.line(f"  {session.peer_name}  {ui.style.dim(state)}  {trust}")
+        if session.peer_fingerprint:
+            ui.line(ui.style.dim(f"    device {session.peer_fingerprint}"))
+
+
+def _verify(arg: str, room: Room, ui: Ui) -> None:
+    """/verify            list codes still to compare
+    /verify NAME       the codes match
+    /verify NAME no    they don't: disconnect"""
+    if not arg:
+        pending = [s for s in room.sessions.values() if s.sas and not s.verified]
+        if not pending:
+            ui.hint("Everyone here is verified (or nobody is connected).")
+        for s in pending:
+            ui.line(f"  {s.peer_name}:  " + "  ".join(f"{e} {w}" for e, w in s.sas))
+        return
+    name, _, answer = arg.rpartition(" ") if arg.endswith((" no", " yes")) else (arg, "", "")
+    session = room.find(name)
+    if session is None or not session.sas:
+        ui.error(f"Nobody connected is called {name!r}. /peers lists who's here.")
+        return
+    room.verify(session, matches=answer != "no")
 
 
 def _show_queue(queue: SendQueue, ui: Ui) -> None:

@@ -28,6 +28,7 @@ class MessageType(StrEnum):
     PING = "ping"
     PONG = "pong"
     BYE = "bye"
+    KEY_EXCHANGE = "key_exchange"
 
 
 class Capability(StrEnum):
@@ -42,3 +43,6 @@ class Capability(StrEnum):
     #: Receivers acknowledge what they've stored (transfer_ack); senders
     #: show acknowledged progress and cap unacknowledged data in flight.
     ACK = "ack"
+    #: End-to-end encryption (D60). Required: peers without it are refused,
+    #: so stripping it from hello can't downgrade a session to plaintext.
+    E2E = "e2e"

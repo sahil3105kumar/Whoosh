@@ -601,3 +601,66 @@ async def test_password_protected_room(server: str, browser: Browser, tmp_path: 
         assert await cli.exit_code() == 0, cli.output()
     finally:
         await cli.close()
+
+
+async def _sas_words_in_browser(page: Page, peer_name: str) -> list[str]:
+    """Open the verify dialog for ``peer_name``; the code's words, in order."""
+    chip = page.get_by_label("People in the room").locator("li", has_text=peer_name)
+    await chip.get_by_role("button", name="Verify").click()
+    code = page.get_by_label("Security code")
+    await code.wait_for(timeout=TIMEOUT_S * 1000)
+    return [w.strip() for w in await code.locator("li div.text-xs").all_inner_texts()]
+
+
+async def test_cli_and_browser_verify_each_other(server: str, browser: Browser, tmp_path: Path):
+    context = await browser.new_context()  # one browser profile: its device key persists
+    await context.add_init_script("localStorage.setItem('whoosh.name', 'webby')")
+    page = await context.new_page()
+    room = await create_room(page, server)
+    cli = await Cli.start(server, "--name", "carol", "join", room, "--out", str(tmp_path))
+    try:
+        await cli.wait_for("Connected peer-to-peer")
+        # The CLI prints the code as "emoji word" pairs on one line
+        line = (await cli.wait_for(r"^\s+(\S+ \S.*)$"))[0]
+        cli_words = [pair.split(" ", 1)[1] for pair in line.strip().split("  ")]
+        browser_words = await _sas_words_in_browser(page, "carol")
+        assert browser_words == cli_words and len(cli_words) == 6
+
+        await page.get_by_role("button", name="They match").click()
+        chip = page.get_by_label("People in the room").locator("li", has_text="carol")
+        await chip.get_by_text("✓").wait_for(timeout=TIMEOUT_S * 1000)
+        await cli.type("/verify webby")
+        await cli.wait_for("webby is now a verified device")
+        await cli.type("/quit")
+        assert await cli.exit_code() == 0
+    finally:
+        await cli.close()
+
+    # A new room, same two devices: recognised as verified, no codes to compare
+    page2 = await context.new_page()
+    room2 = await create_room(page2, server)
+    cli = await Cli.start(server, "--name", "carol", "join", room2, "--out", str(tmp_path))
+    try:
+        await cli.wait_for("webby: end-to-end encrypted, verified device")
+        chip = page2.get_by_label("People in the room").locator("li", has_text="carol")
+        await chip.get_by_text("✓").wait_for(timeout=TIMEOUT_S * 1000)
+        assert await chip.get_by_role("button", name="Verify").count() == 0
+        await cli.type("/quit")
+        assert await cli.exit_code() == 0
+    finally:
+        await cli.close()
+        await context.close()
+
+
+async def test_mismatched_codes_disconnect(server: str, browser: Browser, tmp_path: Path):
+    page = await browser.new_page()
+    room = await create_room(page, server)
+    cli = await Cli.start(server, "--name", "mallory", "join", room, "--out", str(tmp_path))
+    try:
+        await cli.wait_for("Connected peer-to-peer")
+        await _sas_words_in_browser(page, "mallory")
+        await page.get_by_role("button", name="They don't match").click()
+        await page.get_by_text("someone may be intercepting").wait_for(timeout=TIMEOUT_S * 1000)
+        await page.get_by_text("mallory was disconnected.").wait_for(timeout=TIMEOUT_S * 1000)
+    finally:
+        await cli.close()

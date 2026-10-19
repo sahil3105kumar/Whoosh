@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import TextIO
 
 from apps.cli import history
+from apps.cli.identity import TrustStore
+from packages.crypto.channel import SecureChannel
+from packages.crypto.e2e import E2EError, Identity, KeyExchangeMessage
 from packages.protocol.codec import decode, encode
 from packages.protocol.enums import Capability, MessageType
 from packages.protocol.exceptions import ProtocolError
@@ -26,6 +29,7 @@ from packages.protocol.models import (
     ChatPayload,
     ErrorPayload,
     HelloPayload,
+    KeyExchangePayload,
     Payload,
     PingPayload,
     PongPayload,
@@ -44,6 +48,7 @@ CAPABILITIES = [
     Capability.CANCEL,
     Capability.RESUME,
     Capability.ACK,
+    Capability.E2E,
 ]
 
 
@@ -200,8 +205,13 @@ class Session:
         on_stall: Callable[[], None] | None = None,
         name: str | None = None,
         peer_id: str = "",
+        identity: Identity | None = None,
+        trust: TrustStore | None = None,
     ) -> None:
-        self._peer = peer
+        self._identity = identity or Identity.generate()
+        self._trust = trust or TrustStore()
+        #: Every connection is wrapped for end-to-end encryption (D60)
+        self._peer = SecureChannel(peer, self._identity)
         self._ui = ui
         #: Our display name, sent in hello.
         self._name = name
@@ -209,9 +219,21 @@ class Session:
         #: arrives, a short id until then.
         self.peer_name = f"peer-{peer_id[:4]}" if peer_id else "peer"
         self.transfers = TransferManager(
-            peer, download_dir, on_update=self._on_transfer, on_stall=on_stall
+            self._peer, download_dir, on_update=self._on_transfer, on_stall=on_stall
         )
-        #: Resolved with the peer's capabilities when its hello arrives.
+        #: The peer's capabilities from its hello, until encryption is up.
+        self._capabilities: set[Capability] = set()
+        #: The peer's device, once a key exchange has proven it (#30).
+        self.peer_fingerprint: str | None = None
+        #: This device was verified by comparing codes (#32).
+        self.verified = False
+        #: The 6 emoji to compare, for the current connection.
+        self.sas: list[tuple[str, str]] = []
+        #: The peer couldn't be trusted (no encryption, bad keys): don't reconnect.
+        self.refused = False
+        #: Resolved with the peer's capabilities once its hello has arrived
+        #: AND end-to-end encryption is established: nothing else may be sent
+        #: until then.
         self.peer_hello: asyncio.Future[set[Capability]] = (
             asyncio.get_running_loop().create_future()
         )
@@ -225,7 +247,10 @@ class Session:
         self.generation = 0
 
     def start(self) -> None:
-        self._send(MessageType.HELLO, HelloPayload(capabilities=CAPABILITIES, name=self._name))
+        hello = make_message(
+            MessageType.HELLO, HelloPayload(capabilities=CAPABILITIES, name=self._name)
+        )
+        self._peer.send_plain(encode(hello).decode())
 
     def _on_transfer(self, transfer: Transfer) -> None:
         self._ui.transfer_update(transfer, peer=self.peer_name)
@@ -234,8 +259,8 @@ class Session:
 
     def attach(self, peer: WebRTCPeer) -> None:
         """Continue on a new connection after a reconnect."""
-        self._peer = peer
-        self.transfers.attach(peer)
+        self._peer = SecureChannel(peer, self._identity)
+        self.transfers.attach(self._peer)
         self.peer_hello = asyncio.get_running_loop().create_future()
         self.generation += 1
         self.connected.set()
@@ -258,8 +283,9 @@ class Session:
 
     def say_bye(self) -> None:
         """Tell the other side we're leaving on purpose."""
+        # In the clear, so it goes out synchronously (see SecureChannel)
         with contextlib.suppress(ConnectionError):
-            self._send(MessageType.BYE, ByePayload())
+            self._peer.send_plain(encode(make_message(MessageType.BYE, ByePayload())).decode())
 
     async def run_inbound(self) -> None:
         """Process incoming messages until the channel closes."""
@@ -277,6 +303,11 @@ class Session:
                 self._send_error("bad_message", str(exc))
                 continue
             log.debug("recv %s", msg.type)
+            if self._peer.established is None and not isinstance(
+                msg.payload, HelloPayload | KeyExchangePayload | ErrorPayload | ByePayload
+            ):
+                await self._refuse(f"{self.peer_name} sent {msg.type} before encrypting")
+                break
             await self._dispatch(msg)
 
         self.connected.clear()
@@ -287,10 +318,24 @@ class Session:
         if await self.transfers.handle_message(msg):
             return
         if isinstance(payload, HelloPayload):
-            if not self.peer_hello.done():
-                if payload.name:
-                    self.peer_name = _clean_name(payload.name)
-                self.peer_hello.set_result(set(payload.capabilities))
+            if payload.name:
+                self.peer_name = _clean_name(payload.name)
+            self._capabilities = set(payload.capabilities)
+            if Capability.E2E not in self._capabilities:
+                await self._refuse(
+                    f"{self.peer_name} doesn't support end-to-end encryption; not connecting."
+                )
+                return
+            kx = self._peer.key_exchange_message()
+            reply = make_message(
+                MessageType.KEY_EXCHANGE,
+                KeyExchangePayload(
+                    ephemeral=kx.ephemeral, identity=kx.identity, signature=kx.signature
+                ),
+            )
+            self._peer.send_plain(encode(reply).decode())
+        elif isinstance(payload, KeyExchangePayload):
+            await self._key_exchange(payload)
         elif isinstance(payload, ChatPayload):
             self._ui.line(f"{self._ui.style.bold(self.peer_name + ':')} {payload.text}")
         elif isinstance(payload, PingPayload):
@@ -305,6 +350,60 @@ class Session:
             self._ui.error(f"peer reported an error: {payload.code}: {payload.message}")
         else:
             log.debug("ignoring %s message", msg.type)
+
+    async def _key_exchange(self, payload: KeyExchangePayload) -> None:
+        try:
+            established = self._peer.complete(
+                KeyExchangeMessage(payload.ephemeral, payload.identity, payload.signature)
+            )
+        except E2EError as exc:
+            await self._refuse(f"Couldn't set up encryption with {self.peer_name}: {exc}")
+            return
+
+        fingerprint = established.peer_fingerprint
+        first_time = self.peer_fingerprint is None
+        changed = self.peer_fingerprint is not None and fingerprint != self.peer_fingerprint
+        self.peer_fingerprint = fingerprint
+        self.sas = established.sas
+        self.verified = self._trust.is_verified(fingerprint)
+        if changed:
+            self._ui.error(
+                f"{self.peer_name} reconnected from a DIFFERENT device. If you didn't expect "
+                "that, someone may be intercepting: compare codes again (/verify)."
+            )
+            self.verified = False
+        if first_time or changed:
+            self._announce_security()
+        if not self.peer_hello.done():
+            self.peer_hello.set_result(self._capabilities)
+
+    def _announce_security(self) -> None:
+        ui, name = self._ui, self.peer_name
+        if self.verified:
+            ui.ok(f"{name}: end-to-end encrypted, verified device.")
+            return
+        other_devices = [fp for fp in self._trust.verified_as(name) if fp != self.peer_fingerprint]
+        if other_devices:
+            ui.error(
+                f"{name} isn't the device you verified as {name} before. "
+                "Don't trust it until you've compared codes."
+            )
+        ui.line(f"{ui.style.accent('🔒')} {name}: end-to-end encrypted. Compare these with {name}:")
+        ui.line("   " + "  ".join(f"{emoji} {word}" for emoji, word in self.sas))
+        ui.hint(f"   Same on both screens? /verify {name}    Different? /verify {name} no")
+
+    def mark_verified(self) -> None:
+        """The user compared codes and they matched (#32)."""
+        if self.peer_fingerprint is not None:
+            self._trust.verify(self.peer_fingerprint, self.peer_name)
+            self.verified = True
+
+    async def _refuse(self, reason: str) -> None:
+        """Drop a peer that can't be trusted, and don't reconnect to it."""
+        self._ui.error(reason)
+        self.refused = True
+        self.peer_left = True
+        await self._peer.fail(reason)
 
     def send_chat(self, text: str) -> None:
         self._send(MessageType.CHAT, ChatPayload(text=text))

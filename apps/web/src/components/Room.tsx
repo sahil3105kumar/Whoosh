@@ -119,6 +119,8 @@ function RoomView({
 }) {
   const room = useRoom(roomId, password);
   const [inviting, setInviting] = useState(false);
+  const [verifying, setVerifying] = useState<string>();
+  const verifyingPeer = room.peers.find((p) => p.id === verifying);
   const live = room.phase === "connected";
   const canSend = live && room.peerReady;
   const dragging = usePageDrop(canSend, room.sendFiles);
@@ -167,13 +169,24 @@ function RoomView({
         <Button variant="secondary" onClick={leave}>
           Leave
         </Button>
-        {room.peers.length > 0 && <PeerList peers={room.peers} />}
+        {room.peers.length > 0 && <PeerList peers={room.peers} onVerify={setVerifying} />}
         {room.error && (
           <p className="w-full text-sm text-red-600 dark:text-red-400" role="alert">
             {room.error}
           </p>
         )}
       </Card>
+
+      {verifyingPeer?.security && (
+        <VerifyDialog
+          peer={verifyingPeer}
+          onAnswer={(matches) => {
+            room.verify(verifyingPeer.id, matches);
+            setVerifying(undefined);
+          }}
+          onClose={() => setVerifying(undefined)}
+        />
+      )}
 
       {(room.phase === "waiting" || inviting) && <ShareBox roomId={roomId} />}
 
@@ -274,24 +287,101 @@ function useWarnBeforeUnload(active: boolean): void {
   }, [active]);
 }
 
-/** Who's in the room (#26). */
-function PeerList({ peers }: { peers: Peer[] }) {
+/** Who's in the room (#26), and whether each is verified (#30, #32). */
+function PeerList({ peers, onVerify }: { peers: Peer[]; onVerify: (peerId: string) => void }) {
   return (
     <ul className="flex w-full flex-wrap gap-2" aria-label="People in the room">
       {peers.map((p) => (
         <li
           key={p.id}
-          className="flex items-center gap-1.5 rounded-full bg-slate-100 px-2.5 py-0.5 text-xs dark:bg-slate-800"
+          className={`flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs ${
+            p.security?.impostorWarning
+              ? "bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-200"
+              : "bg-slate-100 dark:bg-slate-800"
+          }`}
           title={p.connected ? "Connected" : "Reconnecting"}
         >
           <span
             className={`size-1.5 rounded-full ${p.connected ? "bg-emerald-500" : "animate-pulse bg-amber-400"}`}
             aria-hidden
           />
+          {p.security && <span title="End-to-end encrypted">🔒</span>}
           {p.name}
+          {p.security?.verified && (
+            <span className="text-emerald-600 dark:text-emerald-400" title="Verified device">
+              ✓
+            </span>
+          )}
+          {p.security && !p.security.verified && (
+            <button
+              className="ml-0.5 font-medium text-sky-700 hover:underline dark:text-sky-400"
+              onClick={() => onVerify(p.id)}
+            >
+              Verify
+            </button>
+          )}
         </li>
       ))}
     </ul>
+  );
+}
+
+/** Compare security codes with one peer (#32). */
+function VerifyDialog({
+  peer,
+  onAnswer,
+  onClose,
+}: {
+  peer: Peer;
+  onAnswer: (matches: boolean) => void;
+  onClose: () => void;
+}) {
+  const security = peer.security!;
+  return (
+    <div
+      className="fixed inset-0 z-20 flex items-center justify-center bg-slate-900/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        role="dialog"
+        aria-label={`Verify ${peer.name}`}
+        className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl dark:bg-slate-900"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="font-medium">Verify {peer.name}</h2>
+        {security.impostorWarning && (
+          <p className="mt-2 rounded-lg bg-red-50 p-2 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
+            This isn't the device you verified as {peer.name} before.
+          </p>
+        )}
+        <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">
+          Ask {peer.name} what their screen shows for you — in person or on a call, not in this
+          chat. If the symbols match, nobody is intercepting your connection.
+        </p>
+        <ol className="mt-4 grid grid-cols-3 gap-3 text-center" aria-label="Security code">
+          {security.sas.map(([emoji, word], i) => (
+            <li key={i} className="rounded-lg bg-slate-100 py-2 dark:bg-slate-800">
+              <div className="text-3xl" aria-hidden>
+                {emoji}
+              </div>
+              <div className="text-xs text-slate-600 dark:text-slate-400">{word}</div>
+            </li>
+          ))}
+        </ol>
+        <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
+          Device {security.fingerprint}
+        </p>
+        <div className="mt-5 flex flex-wrap gap-2">
+          <Button onClick={() => onAnswer(true)}>They match</Button>
+          <Button variant="secondary" onClick={() => onAnswer(false)}>
+            They don't match
+          </Button>
+          <Button variant="ghost" onClick={onClose}>
+            Later
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }
 
