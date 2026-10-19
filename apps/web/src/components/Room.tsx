@@ -369,13 +369,15 @@ function Files({
 }
 
 function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: () => void }) {
-  const pct = t.size ? (100 * t.bytesDone) / t.size : 100;
+  // A sender with acks shows what the receiver has stored, not just what left
+  const done = t.direction === "send" && t.acked ? t.bytesAcked : t.bytesDone;
+  const pct = t.size ? (100 * done) / t.size : 100;
   const seconds = (performance.now() - t.startedAt) / 1000;
   // Speed counts this session's bytes only, not what a resume skipped
-  const moved = t.bytesDone - t.resumedFrom;
+  const moved = done - t.resumedFrom;
   const speed = seconds > 0.5 ? moved / seconds : 0;
   const rate = speed ? `${formatBytes(speed)}/s` : "";
-  const eta = speed ? formatDuration((t.size - t.bytesDone) / speed) : "";
+  const eta = speed ? formatDuration((t.size - done) / speed) : "";
   const resumed = t.resumedFrom
     ? `resumed from ${((100 * t.resumedFrom) / (t.size || 1)).toFixed(0)}%`
     : "";

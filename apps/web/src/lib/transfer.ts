@@ -11,6 +11,11 @@
  * file_metadata carries a resume_key and the receiver answers with
  * transfer_accept {offset}; the sender streams only the rest. Received
  * partials are kept in memory for the life of the tab (resume.ts).
+ *
+ * Acknowledgements (D49): with `ack`, the receiver sends transfer_ack every
+ * ACK_EVERY bytes; the sender's progress counts acknowledged bytes and at
+ * most ACK_WINDOW may be unacknowledged. A full window with no ack for the
+ * stall timeout means the connection is dead even if it hasn't said so.
  */
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
@@ -31,6 +36,11 @@ import {
 const CONFIRM_TIMEOUT_MS = 60_000;
 /** Wait this long for transfer_accept (the receiver may re-hash a partial). */
 const ACCEPT_TIMEOUT_MS = 60_000;
+/** Receivers acknowledge after storing this many more bytes. */
+export const ACK_EVERY = 1024 * 1024;
+/** Senders keep at most this many bytes unacknowledged. */
+export const ACK_WINDOW = 8 * 1024 * 1024;
+const STALL_TIMEOUT_MS = 20_000;
 /** Minimum ms between progress callbacks for one transfer. */
 const REPORT_INTERVAL_MS = 100;
 /** Files are read in blocks this size, then cut into chunks. */
@@ -66,6 +76,10 @@ export interface Transfer {
   readonly startedAt: number;
   /** Bytes already in place when this transfer started (resume). */
   readonly resumedFrom: number;
+  /** Sender with acks: bytes the receiver confirmed storing. */
+  readonly bytesAcked: number;
+  /** Whether the receiver acknowledges (sender side). */
+  readonly acked: boolean;
   /** Object URL of the received file, once completed. */
   readonly url?: string;
 }
@@ -73,6 +87,13 @@ export interface Transfer {
 class TransferState {
   bytesDone = 0;
   resumedFrom = 0;
+  bytesAcked = 0;
+  acked = false;
+  /** Receiver: send transfer_ack? And bytes covered by the last one sent. */
+  sendAcks = false;
+  lastAckSent = 0;
+  /** Sender: woken whenever an ack arrives. */
+  ackWaiters: (() => void)[] = [];
   status: TransferStatus = "streaming";
   reason = "";
   url?: string;
@@ -108,15 +129,29 @@ class TransferState {
   }
 
   snapshot(): Transfer {
-    const { id, direction, filename, size, bytesDone, status, reason, startedAt, url, resumedFrom } =
-      this;
-    return { id, direction, filename, size, bytesDone, status, reason, startedAt, url, resumedFrom };
+    const { id, direction, filename, size, bytesDone, status, reason, startedAt, url } = this;
+    const { resumedFrom, bytesAcked, acked } = this;
+    return {
+      id,
+      direction,
+      filename,
+      size,
+      bytesDone,
+      status,
+      reason,
+      startedAt,
+      url,
+      resumedFrom,
+      bytesAcked,
+      acked,
+    };
   }
 }
 
 export interface TransferOptions {
   confirmTimeoutMs?: number;
   acceptTimeoutMs?: number;
+  stallTimeoutMs?: number;
   /** Minimum ms between progress callbacks per transfer. */
   reportIntervalMs?: number;
   /** Where interrupted receives are kept: the tab's store unless injected. */
@@ -127,6 +162,7 @@ export class TransferManager {
   private readonly transfers = new Map<string, TransferState>();
   private readonly confirmTimeoutMs: number;
   private readonly acceptTimeoutMs: number;
+  private readonly stallTimeoutMs: number;
   private readonly reportIntervalMs: number;
   private readonly partials: Map<string, Partial>;
 
@@ -137,6 +173,7 @@ export class TransferManager {
   ) {
     this.confirmTimeoutMs = options.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS;
     this.acceptTimeoutMs = options.acceptTimeoutMs ?? ACCEPT_TIMEOUT_MS;
+    this.stallTimeoutMs = options.stallTimeoutMs ?? STALL_TIMEOUT_MS;
     this.reportIntervalMs = options.reportIntervalMs ?? REPORT_INTERVAL_MS;
     this.partials = options.partials ?? tabPartials;
   }
@@ -146,9 +183,10 @@ export class TransferManager {
   /**
    * Stream `file` to the peer and wait for its confirmation. `resume`: the
    * peer advertised the resume capability, so offer a resume key and start
-   * wherever the receiver says.
+   * wherever the receiver says. `ack`: the peer advertised acks, so ask for
+   * them, show acknowledged progress and keep a bounded window in flight.
    */
-  async sendFile(file: File, { resume = false } = {}): Promise<Transfer> {
+  async sendFile(file: File, { resume = false, ack = false } = {}): Promise<Transfer> {
     const st = new TransferState(
       newTransferId(),
       "send",
@@ -156,6 +194,7 @@ export class TransferManager {
       file.size,
       file.type || "application/octet-stream",
     );
+    st.acked = ack;
     this.transfers.set(st.id, st);
 
     try {
@@ -165,6 +204,7 @@ export class TransferManager {
         size: st.size,
         mime_type: st.mimeType,
         resume_key: resume ? await resumeKey(file) : null,
+        ack,
       });
       const offset = resume ? await this.awaitAccept(st) : 0;
       if (st.finished) return st.snapshot();
@@ -214,7 +254,7 @@ export class TransferManager {
       const end = Math.min(pos + READ_BLOCK, offset);
       st.hash.update(new Uint8Array(await file.slice(pos, end).arrayBuffer()));
     }
-    st.bytesDone = st.resumedFrom = offset;
+    st.bytesDone = st.resumedFrom = st.bytesAcked = offset;
   }
 
   private async stream(st: TransferState, file: File, offset: number): Promise<void> {
@@ -222,6 +262,7 @@ export class TransferManager {
       const block = new Uint8Array(await file.slice(offset, offset + READ_BLOCK).arrayBuffer());
       if (block.length === 0) throw new Error("file shrank while being sent");
       for (let i = 0; i < block.length; i += CHUNK_SIZE) {
+        if (st.acked && !(await this.windowOpen(st))) return;
         await this.channel.drain();
         // Either side may have cancelled while we waited for the buffer
         if (st.finished) return;
@@ -235,6 +276,26 @@ export class TransferManager {
     }
   }
 
+  /** Wait until fewer than ACK_WINDOW bytes are unacknowledged. False if the
+   * transfer ended meanwhile or acks stopped coming. */
+  private async windowOpen(st: TransferState): Promise<boolean> {
+    while (st.bytesDone - st.bytesAcked >= ACK_WINDOW) {
+      if (st.finished) return false;
+      const outcome = await new Promise<"ack" | "timeout">((resolve) => {
+        const timer = setTimeout(() => resolve("timeout"), this.stallTimeoutMs);
+        st.ackWaiters.push(() => {
+          clearTimeout(timer);
+          resolve("ack");
+        });
+      });
+      if (outcome === "timeout") {
+        this.fail(st, `stalled: nothing acknowledged for ${this.stallTimeoutMs / 1000}s`);
+        return false;
+      }
+    }
+    return !st.finished;
+  }
+
   // ── Receiving ─────────────────────────────────────────────────────
 
   /** Handle a transfer-related message; false if `msg` isn't one. */
@@ -243,6 +304,16 @@ export class TransferManager {
       case "file_metadata":
         this.startReceive(msg.payload);
         return true;
+      case "transfer_ack": {
+        const st = this.active(msg.payload.transfer_id);
+        const offset = msg.payload.offset;
+        if (st?.direction === "send" && st.bytesAcked <= offset && offset <= st.bytesDone) {
+          st.bytesAcked = offset;
+          this.wakeAckWaiters(st);
+          this.report(st);
+        }
+        return true;
+      }
       case "transfer_accept": {
         const st = this.active(msg.payload.transfer_id);
         if (st?.direction === "send") st.resolveAccepted(msg.payload.offset);
@@ -285,6 +356,10 @@ export class TransferManager {
     }
     st.hash.update(chunk.data);
     st.bytesDone += chunk.data.length;
+    if (st.sendAcks && st.bytesDone - st.lastAckSent >= ACK_EVERY) {
+      st.lastAckSent = st.bytesDone;
+      this.send("transfer_ack", { transfer_id: st.id, offset: st.bytesDone });
+    }
     this.report(st);
   }
 
@@ -322,6 +397,8 @@ export class TransferManager {
         st.bytesDone = st.resumedFrom = partial.bytes;
       }
     }
+    st.sendAcks = meta.ack ?? false;
+    st.lastAckSent = st.bytesDone;
     this.transfers.set(id, st);
     if (key !== undefined) {
       // The sender offered resume, so it waits for our answer
@@ -336,6 +413,7 @@ export class TransferManager {
 
     if (st.direction === "send") {
       // The receiver's confirmation: verified and saved
+      st.bytesAcked = st.size;
       this.finish(st, "completed", "", false);
       return;
     }
@@ -394,6 +472,12 @@ export class TransferManager {
     return st && !st.finished ? st : undefined;
   }
 
+  private wakeAckWaiters(st: TransferState): void {
+    const waiters = st.ackWaiters;
+    st.ackWaiters = [];
+    for (const wake of waiters) wake();
+  }
+
   private fail(st: TransferState, reason: string): void {
     this.finish(st, "failed", reason, true);
   }
@@ -429,6 +513,7 @@ export class TransferManager {
         // channel already gone; nothing to tell
       }
     }
+    this.wakeAckWaiters(st); // a sender waiting on the window sees the end
     st.resolveDone();
     this.report(st, true);
   }

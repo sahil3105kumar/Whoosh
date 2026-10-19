@@ -47,6 +47,17 @@ class FileMetadataPayload(Payload):
     #: file across sessions so a partial copy can be continued. The
     #: receiver must answer with ``transfer_accept``.
     resume_key: str | None = None
+    #: The sender wants transfer_ack messages. Set only when the receiver
+    #: advertised ``ack``.
+    ack: bool = False
+
+
+class TransferAckPayload(Payload):
+    """Receiver → sender: every byte before ``offset`` has been written to
+    storage. Sent periodically while receiving, when file_metadata asked."""
+
+    transfer_id: str
+    offset: int
 
 
 class TransferAcceptPayload(Payload):
@@ -55,14 +66,6 @@ class TransferAcceptPayload(Payload):
 
     transfer_id: str
     offset: int
-
-
-class ProgressPayload(Payload):
-    """Transfer progress update."""
-
-    transfer_id: str
-    bytes_transferred: int
-    total_bytes: int
 
 
 class TransferCompletePayload(Payload):
@@ -111,10 +114,10 @@ AnyPayload = Annotated[
     HelloPayload
     | ChatPayload
     | FileMetadataPayload
-    | ProgressPayload
     | TransferCompletePayload
     | TransferCancelPayload
     | TransferAcceptPayload
+    | TransferAckPayload
     | ErrorPayload
     | PingPayload
     | PongPayload,

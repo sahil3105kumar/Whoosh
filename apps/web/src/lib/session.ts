@@ -15,7 +15,7 @@ import {
 } from "./protocol";
 import { type Transfer, TransferManager } from "./transfer";
 
-export const CAPABILITIES: Capability[] = ["chat", "file_transfer", "cancel", "resume"];
+export const CAPABILITIES: Capability[] = ["chat", "file_transfer", "cancel", "resume", "ack"];
 
 export interface SessionEvents {
   onChat(text: string): void;
@@ -56,6 +56,11 @@ export class Session {
 
   peerSupports(capability: Capability): boolean {
     return this.peerCapabilities?.has(capability) ?? false;
+  }
+
+  /** sendFile options for what the peer supports. */
+  sendOptions(): { resume: boolean; ack: boolean } {
+    return { resume: this.peerSupports("resume"), ack: this.peerSupports("ack") };
   }
 
   sendChat(text: string): void {

@@ -34,7 +34,19 @@ from packages.transfer.manager import Direction, Transfer, TransferManager, Tran
 
 log = logging.getLogger(__name__)
 
-CAPABILITIES = [Capability.CHAT, Capability.FILE_TRANSFER, Capability.CANCEL, Capability.RESUME]
+CAPABILITIES = [
+    Capability.CHAT,
+    Capability.FILE_TRANSFER,
+    Capability.CANCEL,
+    Capability.RESUME,
+    Capability.ACK,
+]
+
+
+def shown_bytes(t: Transfer) -> int:
+    """Progress to display: for a sender with acks, what the receiver has
+    stored rather than what was handed to the network."""
+    return t.bytes_acked if t.direction is Direction.SEND and t.acked else t.bytes_done
 
 
 def format_bytes(n: float) -> str:
@@ -116,7 +128,7 @@ class Ui:
         arrow = self.style.accent("↑" if t.direction is Direction.SEND else "↓")
         started = self._started.setdefault(t.id, time.monotonic())
         elapsed = max(time.monotonic() - started, 1e-6)
-        sent_now = t.bytes_done - t.resumed_from  # speed counts this session only
+        sent_now = shown_bytes(t) - t.resumed_from  # speed counts this session only
         speed = sent_now / elapsed
 
         if t.status is TransferStatus.STREAMING:
@@ -145,10 +157,11 @@ class Ui:
             self.error(f"{t.filename}: {t.status} ({t.reason})")
 
     def _draw_progress(self, arrow: str, t: Transfer, speed: float) -> None:
-        fraction = t.bytes_done / t.size if t.size else 1.0
-        eta = format_duration((t.size - t.bytes_done) / speed) if speed > 0 else "?"
+        done = shown_bytes(t)
+        fraction = done / t.size if t.size else 1.0
+        eta = format_duration((t.size - done) / speed) if speed > 0 else "?"
         stats = (
-            f" {100 * fraction:3.0f}%  {format_bytes(t.bytes_done)}/{format_bytes(t.size)}"
+            f" {100 * fraction:3.0f}%  {format_bytes(done)}/{format_bytes(t.size)}"
             f"  {format_bytes(speed)}/s  ETA {eta}"
         )
         columns = shutil.get_terminal_size().columns
@@ -226,6 +239,13 @@ class Session:
     def ping(self) -> None:
         # Monotonic is fine across machines: the peer only echoes it back
         self._send(MessageType.PING, PingPayload(timestamp=time.monotonic()))
+
+    def send_options(self) -> dict[str, bool]:
+        """send_file options for what the peer supports."""
+        return {
+            "resume": self.peer_can(Capability.RESUME),
+            "ack": self.peer_can(Capability.ACK),
+        }
 
     def peer_can(self, capability: Capability) -> bool:
         return self.peer_hello.done() and capability in self.peer_hello.result()

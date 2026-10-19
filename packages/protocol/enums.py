@@ -20,10 +20,10 @@ class MessageType(StrEnum):
     HELLO = "hello"
     CHAT = "chat"
     FILE_METADATA = "file_metadata"
-    PROGRESS = "progress"
     TRANSFER_COMPLETE = "transfer_complete"
     TRANSFER_CANCEL = "transfer_cancel"
     TRANSFER_ACCEPT = "transfer_accept"
+    TRANSFER_ACK = "transfer_ack"
     ERROR = "error"
     PING = "ping"
     PONG = "pong"
@@ -38,3 +38,6 @@ class Capability(StrEnum):
     #: Interrupted transfers continue from where they stopped (resume_key
     #: in file_metadata, transfer_accept with an offset).
     RESUME = "resume"
+    #: Receivers acknowledge what they've stored (transfer_ack); senders
+    #: show acknowledged progress and cap unacknowledged data in flight.
+    ACK = "ack"

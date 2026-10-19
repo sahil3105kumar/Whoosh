@@ -624,3 +624,23 @@ DataChannel, so its "close" event may never arrive: the interop test
 that kills the CLI mid-transfer left the browser waiting indefinitely.
 ICE consent checks are the only signal. 8s rides out brief blips,
 which ICE recovers from by itself.
+
+### D49. Acknowledgements: `transfer_ack` every MiB, 8 MiB window, 20 s stall limit
+*2026-10-19 — #18*
+
+**Decision** — When both peers advertise `ack`, the receiver sends
+`transfer_ack {offset}` each time another 1 MiB is written (the CLI
+flushes to disk first: an ack is a promise the bytes are stored). The
+sender's progress counts acknowledged bytes, at most 8 MiB may be
+unacknowledged, and a full window with no ack for 20 s fails the
+transfer as stalled. `transfer_ack` replaces the reserved, never-used
+`progress` message.
+**Why** —
+- *Progress:* "sent" only means handed to the local SCTP stack.
+  Acknowledged bytes are what actually landed, which is what #18 asks for.
+- *Window:* bounds memory on a receiver that can't keep up, and turns
+  "no acks" into a reliable stall signal (#19).
+- *Granularity:* per MiB rather than per chunk; one ack per 64 chunks
+  costs almost nothing.
+- *Protocol change:* `progress` was never sent by anyone, so replacing
+  it costs nothing before a release (D14).

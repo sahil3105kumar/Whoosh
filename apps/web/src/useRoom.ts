@@ -44,7 +44,7 @@ export function useRoom(roomId: string, isCreator: boolean) {
 
     const queue = new SendQueue(async (file) => {
       if (session) {
-        await session.transfers.sendFile(file, { resume: session.peerSupports("resume") });
+        await session.transfers.sendFile(file, session.sendOptions());
       }
     }, setQueued);
     queueRef.current = queue;

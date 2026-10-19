@@ -2,9 +2,9 @@
 
 export const PROTOCOL_VERSION = 1;
 
-export type MessageType = "hello" | "chat" | "file_metadata" | "progress" | "transfer_complete" | "transfer_cancel" | "transfer_accept" | "error" | "ping" | "pong";
+export type MessageType = "hello" | "chat" | "file_metadata" | "transfer_complete" | "transfer_cancel" | "transfer_accept" | "transfer_ack" | "error" | "ping" | "pong";
 
-export type Capability = "chat" | "file_transfer" | "cancel" | "resume";
+export type Capability = "chat" | "file_transfer" | "cancel" | "resume" | "ack";
 
 /** Capability negotiation sent immediately after the DataChannel opens. */
 export interface HelloPayload {
@@ -23,13 +23,7 @@ export interface FileMetadataPayload {
   size: number;
   mime_type?: string;
   resume_key?: string | null;
-}
-
-/** Transfer progress update. */
-export interface ProgressPayload {
-  transfer_id: string;
-  bytes_transferred: number;
-  total_bytes: number;
+  ack?: boolean;
 }
 
 /** Signals that a file transfer finished successfully. */
@@ -46,6 +40,12 @@ export interface TransferCancelPayload {
 
 /** Receiver's answer to a file_metadata carrying a resume_key: start at ``offset`` (bytes it already holds; 0 = from the beginning). */
 export interface TransferAcceptPayload {
+  transfer_id: string;
+  offset: number;
+}
+
+/** Receiver → sender: every byte before ``offset`` has been written to storage. Sent periodically while receiving, when file_metadata asked. */
+export interface TransferAckPayload {
   transfer_id: string;
   offset: number;
 }
@@ -70,10 +70,10 @@ export interface MessageMap {
   hello: HelloPayload;
   chat: ChatPayload;
   file_metadata: FileMetadataPayload;
-  progress: ProgressPayload;
   transfer_complete: TransferCompletePayload;
   transfer_cancel: TransferCancelPayload;
   transfer_accept: TransferAcceptPayload;
+  transfer_ack: TransferAckPayload;
   error: ErrorPayload;
   ping: PingPayload;
   pong: PongPayload;
@@ -99,11 +99,7 @@ export const PAYLOAD_FIELDS: Record<MessageType, Record<string, FieldSpec>> = {
     size: { kind: "integer", optional: false, nullable: false },
     mime_type: { kind: "string", optional: true, nullable: false },
     resume_key: { kind: "string", optional: true, nullable: true },
-  },
-  progress: {
-    transfer_id: { kind: "string", optional: false, nullable: false },
-    bytes_transferred: { kind: "integer", optional: false, nullable: false },
-    total_bytes: { kind: "integer", optional: false, nullable: false },
+    ack: { kind: "boolean", optional: true, nullable: false },
   },
   transfer_complete: {
     transfer_id: { kind: "string", optional: false, nullable: false },
@@ -114,6 +110,10 @@ export const PAYLOAD_FIELDS: Record<MessageType, Record<string, FieldSpec>> = {
     reason: { kind: "string", optional: true, nullable: false },
   },
   transfer_accept: {
+    transfer_id: { kind: "string", optional: false, nullable: false },
+    offset: { kind: "integer", optional: false, nullable: false },
+  },
+  transfer_ack: {
     transfer_id: { kind: "string", optional: false, nullable: false },
     offset: { kind: "integer", optional: false, nullable: false },
   },

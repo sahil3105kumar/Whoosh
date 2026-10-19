@@ -157,3 +157,4 @@ choices that differ from an issue's wording are recorded in
 | Issue | Implementation | Verified by |
 |---|---|---|
 | #17 Resume interrupted transfers | `resume_key` + `transfer_accept {offset}` (D46); partials on disk (CLI) or in the tab (web) (D47); dead-peer detection (D48) | `tests/transfer/test_resume.py`, `resume.test.ts`, interop: page closed mid-upload / CLI killed mid-send |
+| #18 Chunk acknowledgements | `transfer_ack {offset}` every MiB stored; sender shows acknowledged progress, 8 MiB window, stall after 20 s (D49) | `tests/transfer/test_ack.py`, `ack.test.ts`, interop suite |

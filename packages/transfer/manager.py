@@ -7,6 +7,8 @@ Wire sequence for one file (sender → receiver unless noted):
     transfer_accept      JSON   receiver → sender, only if resume_key was
                                 sent: the offset to start from
     chunk frames         binary see frames.py, strictly in offset order
+    transfer_ack         JSON   receiver → sender, every ACK_EVERY bytes
+                                stored, only if file_metadata asked
     transfer_complete    JSON   sha256 of the whole file
     transfer_complete    JSON   receiver → sender, once verified and saved
 
@@ -19,6 +21,11 @@ Resume (docs/decisions.md D46–D47): when the peer advertised the
 holding a partial copy under that key answers with its length and the
 sender streams only the rest. Partials survive a lost connection and
 are deleted on cancel or on any integrity failure.
+
+Acknowledgements (D49): with ``ack``, the sender's progress counts
+bytes the receiver has stored, and at most ACK_WINDOW bytes may be
+unacknowledged. No ack for STALL_TIMEOUT while the window is full means
+the connection is dead even if it hasn't said so.
 
 This module knows nothing about aiortc: it talks to anything with
 ``send()`` and ``drain()`` (see ``Channel``), which WebRTCPeer provides.
@@ -47,6 +54,7 @@ from packages.protocol.models import (
     Payload,
     ProtocolMessage,
     TransferAcceptPayload,
+    TransferAckPayload,
     TransferCancelPayload,
     TransferCompletePayload,
     make_message,
@@ -64,6 +72,16 @@ DEFAULT_CONFIRM_TIMEOUT = 60.0
 #: How long a sender waits for transfer_accept. The receiver may first
 #: re-hash a large partial from disk.
 DEFAULT_ACCEPT_TIMEOUT = 60.0
+
+#: Receivers acknowledge after storing this many more bytes.
+ACK_EVERY = 1024 * 1024
+
+#: Senders keep at most this many bytes unacknowledged (sent, not stored).
+ACK_WINDOW = 8 * 1024 * 1024
+
+#: A sender with a full window and no ack for this long gives up: the
+#: receiver or the path to it has stopped working.
+DEFAULT_STALL_TIMEOUT = 20.0
 
 #: Minimum seconds between progress callbacks for one transfer.
 _REPORT_INTERVAL = 0.1
@@ -103,6 +121,10 @@ class Transfer:
     bytes_done: int = 0
     #: Bytes that were already in place when this transfer started.
     resumed_from: int = 0
+    #: Sender: bytes the receiver confirmed storing. Only meaningful when
+    #: ``acked`` (the receiver supports acks); otherwise equals bytes_done.
+    bytes_acked: int = 0
+    acked: bool = False
     status: TransferStatus = TransferStatus.STREAMING
     reason: str = ""
 
@@ -110,6 +132,11 @@ class Transfer:
         default_factory=lambda: asyncio.get_running_loop().create_future(), repr=False
     )
     #: Sender: resolved with the receiver's starting offset.
+    #: Sender: set whenever a transfer_ack arrives.
+    _ack_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    #: Receiver: bytes covered by the last ack sent, and whether to send them.
+    _last_ack_sent: int = field(default=0, repr=False)
+    _send_acks: bool = field(default=False, repr=False)
     _accepted: asyncio.Future[int] = field(
         default_factory=lambda: asyncio.get_running_loop().create_future(), repr=False
     )
@@ -131,6 +158,7 @@ class TransferManager:
         on_update: Callable[[Transfer], None] | None = None,
         confirm_timeout: float = DEFAULT_CONFIRM_TIMEOUT,
         accept_timeout: float = DEFAULT_ACCEPT_TIMEOUT,
+        stall_timeout: float = DEFAULT_STALL_TIMEOUT,
     ) -> None:
         self._channel = channel
         self._download_dir = download_dir
@@ -138,6 +166,7 @@ class TransferManager:
         self._on_update = on_update
         self._confirm_timeout = confirm_timeout
         self._accept_timeout = accept_timeout
+        self._stall_timeout = stall_timeout
         self._transfers: dict[str, Transfer] = {}
         with contextlib.suppress(OSError):
             self._partials.cleanup()
@@ -148,11 +177,13 @@ class TransferManager:
 
     # ── Sending ─────────────────────────────────────────────────────
 
-    async def send_file(self, path: Path, *, resume: bool = False) -> Transfer:
+    async def send_file(self, path: Path, *, resume: bool = False, ack: bool = False) -> Transfer:
         """Stream ``path`` to the peer and wait for its confirmation.
 
         ``resume``: the peer advertised the resume capability, so offer a
         resume key and start wherever the receiver says.
+        ``ack``: the peer advertised acks, so ask for them, report
+        acknowledged progress and keep a bounded window in flight.
 
         Returns the finished Transfer; check ``status`` for the outcome.
         Raises OSError only if the file can't be opened at all.
@@ -164,6 +195,7 @@ class TransferManager:
             filename=path.name,
             size=size,
             path=path,
+            acked=ack,
         )
         mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
@@ -178,6 +210,7 @@ class TransferManager:
                         size=size,
                         mime_type=mime_type,
                         resume_key=resume_key(path) if resume else None,
+                        ack=ack,
                     ),
                 )
                 offset = await self._await_accept(transfer) if resume else 0
@@ -233,10 +266,12 @@ class TransferManager:
                 raise OSError("file shrank since the transfer was offered")
             transfer._hash.update(block)
             remaining -= len(block)
-        transfer.bytes_done = transfer.resumed_from = offset
+        transfer.bytes_done = transfer.resumed_from = transfer.bytes_acked = offset
 
     async def _stream(self, transfer: Transfer, f: IO[bytes], offset: int) -> None:
         while chunk := f.read(CHUNK_SIZE):
+            if transfer.acked and not await self._window_open(transfer):
+                return
             await self._channel.drain()
             # Either side may have cancelled while we waited for the buffer
             if transfer.status.finished:
@@ -250,6 +285,21 @@ class TransferManager:
         if offset != transfer.size:
             self._fail(transfer, "file changed while it was being sent")
 
+    async def _window_open(self, transfer: Transfer) -> bool:
+        """Wait until fewer than ACK_WINDOW bytes are unacknowledged.
+        False if the transfer ended meanwhile or acks stopped coming."""
+        while transfer.bytes_done - transfer.bytes_acked >= ACK_WINDOW:
+            if transfer.status.finished:
+                return False
+            transfer._ack_event.clear()
+            try:
+                await asyncio.wait_for(transfer._ack_event.wait(), self._stall_timeout)
+            except TimeoutError:
+                quiet = f"{self._stall_timeout:.0f}s"
+                self._fail(transfer, f"stalled: nothing acknowledged for {quiet}")
+                return False
+        return not transfer.status.finished
+
     # ── Receiving ───────────────────────────────────────────────────
 
     async def handle_message(self, msg: ProtocolMessage) -> bool:
@@ -261,6 +311,16 @@ class TransferManager:
         payload = msg.payload
         if isinstance(payload, FileMetadataPayload):
             self._start_receive(payload)
+        elif isinstance(payload, TransferAckPayload):
+            transfer = self._active(payload.transfer_id)
+            if (
+                transfer is not None
+                and transfer.direction is Direction.SEND
+                and transfer.bytes_acked <= payload.offset <= transfer.bytes_done
+            ):
+                transfer.bytes_acked = payload.offset
+                transfer._ack_event.set()
+                self._report(transfer)
         elif isinstance(payload, TransferAcceptPayload):
             transfer = self._active(payload.transfer_id)
             if (
@@ -302,6 +362,8 @@ class TransferManager:
             return
         transfer._hash.update(chunk.data)
         transfer.bytes_done += len(chunk.data)
+        if transfer._send_acks and transfer.bytes_done - transfer._last_ack_sent >= ACK_EVERY:
+            self._ack(transfer)
         self._report(transfer)
 
     def _start_receive(self, meta: FileMetadataPayload) -> None:
@@ -360,6 +422,8 @@ class TransferManager:
             _file=file,
             _partial=partial,
             _resumable=resumable,
+            _send_acks=meta.ack,
+            _last_ack_sent=offset,
         )
 
         self._transfers[transfer_id] = transfer
@@ -378,6 +442,7 @@ class TransferManager:
 
         if transfer.direction is Direction.SEND:
             # The receiver's confirmation: verified and saved
+            transfer.bytes_acked = transfer.size
             self._finish(transfer, TransferStatus.COMPLETED, notify=False)
             return
 
@@ -434,6 +499,22 @@ class TransferManager:
         if transfer is None or transfer.status.finished:
             return None
         return transfer
+
+    def _ack(self, transfer: Transfer) -> None:
+        """Tell the sender how much is stored. Flush first: an ack is a
+        promise that the bytes survive this process dying."""
+        assert transfer._file is not None
+        try:
+            transfer._file.flush()
+        except OSError as exc:
+            self._fail(transfer, f"write error: {exc}")
+            return
+        transfer._last_ack_sent = transfer.bytes_done
+        with contextlib.suppress(ConnectionError):
+            self._send(
+                MessageType.TRANSFER_ACK,
+                TransferAckPayload(transfer_id=transfer.id, offset=transfer.bytes_done),
+            )
 
     def _fail(self, transfer: Transfer, reason: str) -> None:
         self._finish(transfer, TransferStatus.FAILED, reason, notify=True)

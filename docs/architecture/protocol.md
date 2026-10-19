@@ -30,7 +30,7 @@ Every text frame is one message in the same envelope.
 ### hello
 
 Sent by both peers as soon as the channel opens.
-`{"capabilities": ["chat", "file_transfer", "cancel", "resume"]}`
+`{"capabilities": ["chat", "file_transfer", "cancel", "resume", "ack"]}`
 
 Optional behaviour (like `resume`) is used only when *both* peers
 advertise it, so clients with different feature sets still interoperate.
@@ -45,11 +45,12 @@ has advertised `file_transfer`.
 ### file_metadata
 
 Announces an incoming file. Sender → receiver.
-`{"transfer_id": "<uuid hex>", "filename": "...", "size": 123, "mime_type": "...", "resume_key": "<hex>" | null}`
+`{"transfer_id": "<uuid hex>", "filename": "...", "size": 123, "mime_type": "...", "resume_key": "<hex>" | null, "ack": false}`
 
 `resume_key` is sent only when the receiver advertised `resume`; the
 receiver must then answer with `transfer_accept`. It identifies the
-file across sessions (see [Resume](#resume)).
+file across sessions (see [Resume](#resume)). `ack: true` (sent only
+when the receiver advertised `ack`) asks for `transfer_ack` messages.
 
 `filename` is a suggestion only: the receiver strips any directory
 components and picks a non-colliding name in its download directory.
@@ -82,10 +83,17 @@ for a user cancel or for an error (checksum mismatch, disk full,
 out-of-order chunk, rejected metadata). The receiver deletes any
 partial data. Chunks still in flight after a cancel are dropped.
 
-### progress
+### transfer_ack
 
-Reserved. In v1 each side computes progress locally; v2.0 will use this
-for chunk acknowledgements and resume.
+`{"transfer_id": "...", "offset": 1048576}` — receiver → sender, when
+`file_metadata` asked for acks: every byte before `offset` has been
+written to storage. Sent each time another 1 MiB is stored; the final
+`transfer_complete` echo covers the tail.
+
+The sender shows acknowledged bytes as its progress and keeps at most
+8 MiB unacknowledged. A full window with no ack for 20 s fails the
+transfer as stalled: the connection is dead even if it hasn't said so.
+Acks outside `[last ack, bytes sent]` are ignored.
 
 ### error
 
