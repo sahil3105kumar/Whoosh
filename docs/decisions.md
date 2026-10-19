@@ -838,3 +838,63 @@ credentials could relay into the server's own network.
 **Verified** — Against a real coturn: two relay-only browsers, and the
 CLI to a relay-only browser, connect with the selected candidate pair of
 type `relay`, and transfer files intact.
+
+### D60. Mandatory application-layer end-to-end encryption
+*2026-10-19 — #29*
+
+**Decision** — Every pair runs an X25519 key exchange right after
+`hello` and encrypts everything after it with AES-256-GCM (spec
+"whoosh-e2e-v1", in protocol.md; one implementation per client, held to
+shared test vectors). Peers without the `e2e` capability are refused.
+`hello`, `key_exchange` and `bye` are the only messages in the clear.
+**Why** — DTLS already encrypts WebRTC, but its key fingerprints travel
+in the SDP, which the *signaling server* relays — so whoever runs (or
+breaks into) the server can swap them and sit in the middle of every
+connection. An application-layer exchange alone has the same flaw; it's
+the verification in D62 that closes it, and the second layer is what
+that verification protects.
+- *Mandatory, not negotiated:* if it were optional, the same attacker
+  could strip `e2e` from both `hello`s and downgrade the session.
+  No client has been released without it, so mandatory costs nothing.
+- *`bye` in the clear:* it must go out synchronously at the last moment
+  (a closing tab can't await WebCrypto, and the app closes connections
+  right after). It carries nothing; a forged one can only end a session,
+  which an attacker on the path can do anyway. Sealing it was tried
+  first: the browser closed the channel before the sealed frame left,
+  peers waited 30 s for the grace period, and the interop suite tripled
+  in duration.
+- *Ordering:* WebCrypto is asynchronous, so the browser seals and opens
+  through promise chains, and close notifications queue behind pending
+  decryption (otherwise a `bye` still being decrypted is missed).
+
+### D61. Device identity: an Ed25519 key per device, remembered when verified
+*2026-10-19 — #30*
+
+**Decision** — Each device has a long-term Ed25519 identity that signs
+every connection's ephemeral key. CLI: `$XDG_DATA_HOME/whoosh/identity.key`
+(created 0600; `WHOOSH_DATA_DIR` overrides). Web: IndexedDB, as a
+**non-extractable** CryptoKey (signs, can't be read out). Verified devices
+are stored by fingerprint with the name they had (`trusted.json` /
+`localStorage`). A connection from a verified device is trusted without
+comparing codes; a familiar name on an unverified device, or a peer whose
+device changes mid-session, is flagged.
+**Why** — Comparing codes every time is the step people skip. Doing it
+once per device pair and remembering it keeps the protection without the
+friction. Names are self-chosen (D56), so trust attaches to keys, never
+to names.
+
+### D62. Key verification by comparing 6 emoji
+*2026-10-19 — #32*
+
+**Decision** — Both sides derive 6 emoji (36 bits) from the exchange
+transcript, using Matrix's 64-emoji SAS table. CLI: printed on connect,
+`/verify NAME` (or `/verify NAME no`), `/verify` to list. Web: a
+**Verify** button on each peer, a dialog with **They match / They don't
+match**. A mismatch disconnects the peer and stops reconnecting to it.
+**Why** — A man in the middle runs two exchanges, so the two screens
+show different codes; 36 bits gives one chance in ~69 billion of an
+undetected one. Emoji with names are quick to compare aloud or on a
+call, and a known, tested table avoids look-alikes.
+**Verified** — Python and browser compute identical codes from the same
+keys (shared vectors, and live in the interop suite), and a simulated
+man in the middle produces different codes in both suites.

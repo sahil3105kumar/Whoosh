@@ -36,7 +36,7 @@ Every text frame is one message in the same envelope.
 ### hello
 
 Sent by both peers as soon as the channel opens.
-`{"capabilities": ["chat", "file_transfer", "cancel", "resume", "ack"], "name": "alice" | null}`
+`{"capabilities": ["chat", "file_transfer", "cancel", "resume", "ack", "e2e"], "name": "alice" | null}`
 
 `name` is the display name shown to others; it's self-chosen, so it's a
 label, not an identity. Receivers strip control characters and cap it at
@@ -47,6 +47,12 @@ advertise it, so clients with different feature sets still interoperate.
 
 A peer must not start a file transfer until the other side's `hello`
 has advertised `file_transfer`.
+
+### key_exchange
+
+`{"ephemeral": "<base64 X25519>", "identity": "<base64 Ed25519>", "signature": "<base64>"}`
+— sent right after receiving the peer's `hello`. Everything after it is
+end-to-end encrypted; see [End-to-end encryption](#end-to-end-encryption).
 
 ### chat
 
@@ -215,6 +221,50 @@ in the room and reconnect:
 * On the new connection both sides send `hello` again. Interrupted
   outgoing transfers are re-sent (up to 3 attempts per file) and resume
   from the receiver's partial copy.
+
+## End-to-end encryption
+
+Spec "whoosh-e2e-v1" (`packages/crypto/e2e.py`, `apps/web/src/lib/e2e.ts`;
+shared test vectors in `tests/vectors/e2e.json`). It's **mandatory**: a
+peer whose `hello` lacks `e2e` is refused, so stripping the capability
+can't downgrade a session to plaintext.
+
+**In the clear** (inside DTLS): `hello`, `key_exchange`, and `bye`. Any
+other message before the exchange completes is refused; after it, every
+message — JSON or file chunk — is a binary frame:
+
+```
+0x02 || counter (u64 BE) || AES-256-GCM(key, nonce = 0x00000000 || counter,
+                                         plaintext = 0x00 || utf-8 text
+                                                   | 0x01 || binary,
+                                         aad = "whoosh-e2e-v1")
+```
+
+Counters start at 0 per direction and the channel is ordered, so the
+receiver accepts only the exact next counter: replays, reordering and
+tampering all close the connection.
+
+**Keys.** Each device has a long-term Ed25519 identity; each connection a
+fresh X25519 key. `key_exchange.signature` is Ed25519 over
+`"whoosh-e2e-v1/kx" || ephemeral`. With `block = identity || ephemeral`:
+
+```
+transcript = SHA-256("whoosh-e2e-v1/transcript" || min(blocks) || max(blocks))
+okm        = HKDF-SHA256(X25519(mine, theirs), salt = transcript,
+                         info = "whoosh-e2e-v1/keys", 64 bytes)
+```
+
+The side whose block sorts first sends with `okm[0:32]`, the other with
+`okm[32:64]`.
+
+**Verification.** Both sides show 6 emoji: the first 36 bits of
+`SHA-256("whoosh-e2e-v1/sas" || transcript)`, 6 bits each, indexing the
+64-entry table. Someone in the middle has to run a separate exchange with
+each side, so the two screens show different codes. Comparing them once
+marks the peer's device (fingerprint = first 32 hex digits of
+SHA-256(identity)) as verified; later sessions with that device are
+trusted without comparing again, and a known name on a new device is
+flagged.
 
 ## Versioning
 
