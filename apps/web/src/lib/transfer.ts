@@ -6,12 +6,18 @@
  *   ← transfer_complete (receiver confirms after verifying)
  *
  * Either side may send transfer_cancel at any point.
+ *
+ * Resume (docs/decisions.md D46–D47): when the peer advertised `resume`,
+ * file_metadata carries a resume_key and the receiver answers with
+ * transfer_accept {offset}; the sender streams only the rest. Received
+ * partials are kept in memory for the life of the tab (resume.ts).
  */
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 
 import { safeFilename } from "./filenames";
 import { CHUNK_SIZE, decodeFrame, encodeChunk, newTransferId, uuidHex } from "./frames";
+import { type Hasher, type Partial, isResumeKey, resumeKey, tabPartials } from "./resume";
 import {
   type FileMetadataPayload,
   type MessageMap,
@@ -23,6 +29,8 @@ import {
 
 /** Wait this long for the receiver to confirm a fully sent file. */
 const CONFIRM_TIMEOUT_MS = 60_000;
+/** Wait this long for transfer_accept (the receiver may re-hash a partial). */
+const ACCEPT_TIMEOUT_MS = 60_000;
 /** Minimum ms between progress callbacks for one transfer. */
 const REPORT_INTERVAL_MS = 100;
 /** Files are read in blocks this size, then cut into chunks. */
@@ -56,18 +64,26 @@ export interface Transfer {
   readonly status: TransferStatus;
   readonly reason: string;
   readonly startedAt: number;
+  /** Bytes already in place when this transfer started (resume). */
+  readonly resumedFrom: number;
   /** Object URL of the received file, once completed. */
   readonly url?: string;
 }
 
 class TransferState {
   bytesDone = 0;
+  resumedFrom = 0;
   status: TransferStatus = "streaming";
   reason = "";
   url?: string;
   readonly startedAt = performance.now();
-  readonly hash = sha256.create();
+  hash: Hasher = sha256.create();
   lastReport = 0;
+  /** Receive side: resume key this partial is kept under, if resumable. */
+  resumeKey?: string;
+  // sender: resolved with the receiver's starting offset
+  readonly accepted: Promise<number>;
+  resolveAccepted!: (offset: number) => void;
   // receive side
   parts: Uint8Array[] = [];
   partBytes = 0;
@@ -84,6 +100,7 @@ class TransferState {
     readonly mimeType: string,
   ) {
     this.done = new Promise((resolve) => (this.resolveDone = resolve));
+    this.accepted = new Promise((resolve) => (this.resolveAccepted = resolve));
   }
 
   get finished(): boolean {
@@ -91,24 +108,47 @@ class TransferState {
   }
 
   snapshot(): Transfer {
-    const { id, direction, filename, size, bytesDone, status, reason, startedAt, url } = this;
-    return { id, direction, filename, size, bytesDone, status, reason, startedAt, url };
+    const { id, direction, filename, size, bytesDone, status, reason, startedAt, url, resumedFrom } =
+      this;
+    return { id, direction, filename, size, bytesDone, status, reason, startedAt, url, resumedFrom };
   }
+}
+
+export interface TransferOptions {
+  confirmTimeoutMs?: number;
+  acceptTimeoutMs?: number;
+  /** Minimum ms between progress callbacks per transfer. */
+  reportIntervalMs?: number;
+  /** Where interrupted receives are kept: the tab's store unless injected. */
+  partials?: Map<string, Partial>;
 }
 
 export class TransferManager {
   private readonly transfers = new Map<string, TransferState>();
+  private readonly confirmTimeoutMs: number;
+  private readonly acceptTimeoutMs: number;
+  private readonly reportIntervalMs: number;
+  private readonly partials: Map<string, Partial>;
 
   constructor(
     private readonly channel: Channel,
     private readonly onUpdate: (transfer: Transfer) => void = () => {},
-    private readonly confirmTimeoutMs = CONFIRM_TIMEOUT_MS,
-  ) {}
+    options: TransferOptions = {},
+  ) {
+    this.confirmTimeoutMs = options.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS;
+    this.acceptTimeoutMs = options.acceptTimeoutMs ?? ACCEPT_TIMEOUT_MS;
+    this.reportIntervalMs = options.reportIntervalMs ?? REPORT_INTERVAL_MS;
+    this.partials = options.partials ?? tabPartials;
+  }
 
   // ── Sending ───────────────────────────────────────────────────────
 
-  /** Stream `file` to the peer and wait for its confirmation. */
-  async sendFile(file: File): Promise<Transfer> {
+  /**
+   * Stream `file` to the peer and wait for its confirmation. `resume`: the
+   * peer advertised the resume capability, so offer a resume key and start
+   * wherever the receiver says.
+   */
+  async sendFile(file: File, { resume = false } = {}): Promise<Transfer> {
     const st = new TransferState(
       newTransferId(),
       "send",
@@ -124,9 +164,13 @@ export class TransferManager {
         filename: st.filename,
         size: st.size,
         mime_type: st.mimeType,
+        resume_key: resume ? await resumeKey(file) : null,
       });
+      const offset = resume ? await this.awaitAccept(st) : 0;
+      if (st.finished) return st.snapshot();
+      if (offset) await this.skipPrefix(st, file, offset);
       this.report(st, true);
-      await this.stream(st, file);
+      await this.stream(st, file, offset);
 
       if (!st.finished) {
         this.send("transfer_complete", { transfer_id: st.id, sha256: bytesToHex(st.hash.digest()) });
@@ -144,8 +188,36 @@ export class TransferManager {
     return st.snapshot();
   }
 
-  private async stream(st: TransferState, file: File): Promise<void> {
-    let offset = 0;
+  /** Wait for transfer_accept (or for the transfer to end first). */
+  private async awaitAccept(st: TransferState): Promise<number> {
+    const result = await Promise.race([
+      st.accepted,
+      st.done.then(() => undefined),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), this.acceptTimeoutMs)),
+    ]);
+    if (st.finished || result === undefined) return 0;
+    if (result === null) {
+      this.fail(st, "receiver did not answer the transfer offer");
+      return 0;
+    }
+    if (!Number.isSafeInteger(result) || result < 0 || result > st.size) {
+      this.fail(st, `receiver asked for an invalid offset ${result}`);
+      return 0;
+    }
+    return result;
+  }
+
+  /** Hash the part the receiver already has without sending it: the final
+   * sha256 covers the whole file. */
+  private async skipPrefix(st: TransferState, file: File, offset: number): Promise<void> {
+    for (let pos = 0; pos < offset; pos += READ_BLOCK) {
+      const end = Math.min(pos + READ_BLOCK, offset);
+      st.hash.update(new Uint8Array(await file.slice(pos, end).arrayBuffer()));
+    }
+    st.bytesDone = st.resumedFrom = offset;
+  }
+
+  private async stream(st: TransferState, file: File, offset: number): Promise<void> {
     while (offset < st.size) {
       const block = new Uint8Array(await file.slice(offset, offset + READ_BLOCK).arrayBuffer());
       if (block.length === 0) throw new Error("file shrank while being sent");
@@ -171,6 +243,11 @@ export class TransferManager {
       case "file_metadata":
         this.startReceive(msg.payload);
         return true;
+      case "transfer_accept": {
+        const st = this.active(msg.payload.transfer_id);
+        if (st?.direction === "send") st.resolveAccepted(msg.payload.offset);
+        return true;
+      }
       case "transfer_complete":
         this.handleComplete(msg.payload);
         return true;
@@ -221,6 +298,10 @@ export class TransferManager {
     }
     if (this.transfers.has(id)) return this.reject(meta.transfer_id, "duplicate transfer id");
     if (meta.size < 0) return this.reject(meta.transfer_id, "invalid size");
+    const key = meta.resume_key ?? undefined;
+    if (key !== undefined && !isResumeKey(key)) {
+      return this.reject(meta.transfer_id, "invalid resume key");
+    }
 
     const st = new TransferState(
       id,
@@ -229,7 +310,23 @@ export class TransferManager {
       meta.size,
       meta.mime_type ?? "application/octet-stream",
     );
+    // Resume under the sender's key, unless another active transfer has it
+    const inUse = [...this.transfers.values()].some((t) => !t.finished && t.resumeKey === key);
+    if (key !== undefined && !inUse) {
+      st.resumeKey = key;
+      const partial = this.partials.get(key);
+      this.partials.delete(key); // owned by this transfer now
+      if (partial && partial.size === meta.size && partial.bytes <= meta.size) {
+        st.blobs = partial.blobs;
+        st.hash = partial.hash;
+        st.bytesDone = st.resumedFrom = partial.bytes;
+      }
+    }
     this.transfers.set(id, st);
+    if (key !== undefined) {
+      // The sender offered resume, so it waits for our answer
+      this.send("transfer_accept", { transfer_id: meta.transfer_id, offset: st.bytesDone });
+    }
     this.report(st, true);
   }
 
@@ -268,10 +365,11 @@ export class TransferManager {
     return true;
   }
 
-  /** Fail every active transfer without notifying the peer (channel gone). */
+  /** Fail every active transfer without notifying the peer (channel gone).
+   * Resumable partials are kept. */
   close(reason = "connection closed"): void {
     for (const st of this.transfers.values()) {
-      if (!st.finished) this.finish(st, "failed", reason, false);
+      if (!st.finished) this.finish(st, "failed", reason, false, true);
     }
   }
 
@@ -300,11 +398,27 @@ export class TransferManager {
     this.finish(st, "failed", reason, true);
   }
 
-  private finish(st: TransferState, status: TransferStatus, reason: string, notify: boolean): void {
+  /** End a transfer. Received data is dropped unless `keepPartial` and it's
+   * resumable: cancels and integrity failures must leave nothing to resume. */
+  private finish(
+    st: TransferState,
+    status: TransferStatus,
+    reason: string,
+    notify: boolean,
+    keepPartial = false,
+  ): void {
     if (st.finished) return;
     st.status = status;
     st.reason = reason;
     if (status !== "completed") {
+      if (keepPartial && st.resumeKey !== undefined && st.bytesDone > 0) {
+        this.partials.set(st.resumeKey, {
+          size: st.size,
+          bytes: st.bytesDone,
+          blobs: [...st.blobs, new Blob(st.parts as BlobPart[])],
+          hash: st.hash.clone(),
+        });
+      }
       st.parts = [];
       st.blobs = [];
     }
@@ -334,7 +448,7 @@ export class TransferManager {
 
   private report(st: TransferState, force = false): void {
     const now = performance.now();
-    if (force || now - st.lastReport >= REPORT_INTERVAL_MS) {
+    if (force || now - st.lastReport >= this.reportIntervalMs) {
       st.lastReport = now;
       this.onUpdate(st.snapshot());
     }

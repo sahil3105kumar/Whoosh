@@ -151,3 +151,9 @@ choices that differ from an issue's wording are recorded in
 | #14 Improved transfer queue | `SendQueue` in both clients: ordered, one at a time, removable (D43); CLI `/queue` | `queue.test.ts`, `tests/cli/test_cli.py` |
 | #15 Better CLI experience | Progress bar with speed/ETA, colour (TTY only, `NO_COLOR`), friendly errors, room codes or invite links as arguments, help when run bare (D45) | `tests/cli/test_cli.py` |
 | #16 UI improvements | Latency in the status bar, unread count in the tab title, ETA per transfer, confirm before leaving mid-transfer, **Try again** after a failed connection, invite links accepted in the join box, empty state | interop suite, screenshots |
+
+## v2.0 — Reliable Transfers
+
+| Issue | Implementation | Verified by |
+|---|---|---|
+| #17 Resume interrupted transfers | `resume_key` + `transfer_accept {offset}` (D46); partials on disk (CLI) or in the tab (web) (D47); dead-peer detection (D48) | `tests/transfer/test_resume.py`, `resume.test.ts`, interop: page closed mid-upload / CLI killed mid-send |

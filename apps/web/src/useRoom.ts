@@ -43,7 +43,9 @@ export function useRoom(roomId: string, isCreator: boolean) {
     let pinger: ReturnType<typeof setInterval> | undefined;
 
     const queue = new SendQueue(async (file) => {
-      if (session) await session.transfers.sendFile(file);
+      if (session) {
+        await session.transfers.sendFile(file, { resume: session.peerSupports("resume") });
+      }
     }, setQueued);
     queueRef.current = queue;
 

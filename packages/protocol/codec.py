@@ -28,6 +28,7 @@ from packages.protocol.models import (
     PongPayload,
     ProgressPayload,
     ProtocolMessage,
+    TransferAcceptPayload,
     TransferCancelPayload,
     TransferCompletePayload,
 )
@@ -40,6 +41,7 @@ PAYLOAD_REGISTRY: dict[MessageType, type[Payload]] = {
     MessageType.PROGRESS: ProgressPayload,
     MessageType.TRANSFER_COMPLETE: TransferCompletePayload,
     MessageType.TRANSFER_CANCEL: TransferCancelPayload,
+    MessageType.TRANSFER_ACCEPT: TransferAcceptPayload,
     MessageType.ERROR: ErrorPayload,
     MessageType.PING: PingPayload,
     MessageType.PONG: PongPayload,

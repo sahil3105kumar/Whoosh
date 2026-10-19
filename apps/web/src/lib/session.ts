@@ -15,7 +15,7 @@ import {
 } from "./protocol";
 import { type Transfer, TransferManager } from "./transfer";
 
-export const CAPABILITIES: Capability[] = ["chat", "file_transfer", "cancel"];
+export const CAPABILITIES: Capability[] = ["chat", "file_transfer", "cancel", "resume"];
 
 export interface SessionEvents {
   onChat(text: string): void;
@@ -43,7 +43,7 @@ export class Session {
     channel.dc.addEventListener("message", (event: MessageEvent<string | ArrayBuffer>) =>
       this.onMessage(event.data),
     );
-    channel.dc.addEventListener("close", () => {
+    channel.onClose(() => {
       this.transfers.close("connection closed");
       events.onClosed();
     });
@@ -51,7 +51,11 @@ export class Session {
   }
 
   canSendFiles(): boolean {
-    return this.peerCapabilities?.has("file_transfer") ?? false;
+    return this.peerSupports("file_transfer");
+  }
+
+  peerSupports(capability: Capability): boolean {
+    return this.peerCapabilities?.has(capability) ?? false;
   }
 
   sendChat(text: string): void {

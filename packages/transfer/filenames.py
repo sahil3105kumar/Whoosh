@@ -15,7 +15,6 @@ from pathlib import Path
 _UNSAFE = re.compile(r'[\\/<>:"|?*\x00-\x1f\x7f]')
 _MAX_NAME_BYTES = 255
 _FALLBACK = "download"
-PART_SUFFIX = ".part"
 
 
 def safe_filename(name: str) -> str:
@@ -38,15 +37,11 @@ def safe_filename(name: str) -> str:
 
 def unique_path(directory: Path, filename: str) -> Path:
     """``directory/filename``, or ``name (1).ext``, ``name (2).ext``, ...
-    if that file (or its in-progress .part) already exists."""
+    if that file already exists."""
     candidate = directory / filename
     stem, suffix = Path(filename).stem, Path(filename).suffix
     n = 1
-    while candidate.exists() or part_path(candidate).exists():
+    while candidate.exists():
         candidate = directory / f"{stem} ({n}){suffix}"
         n += 1
     return candidate
-
-
-def part_path(path: Path) -> Path:
-    return path.with_name(path.name + PART_SUFFIX)

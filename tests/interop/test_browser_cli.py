@@ -183,7 +183,8 @@ class Cli:
 
 def pattern_bytes(size: int, seed: int) -> bytes:
     """Deterministic content both sides can generate: (i*31 + seed) % 256."""
-    return bytes((i * 31 + seed) % 256 for i in range(size))
+    period = bytes((i * 31 + seed) % 256 for i in range(256))  # repeats every 256 bytes
+    return (period * (size // 256 + 1))[:size]
 
 
 async def create_room(page: Page, server: str) -> str:
@@ -197,21 +198,34 @@ async def wait_connected(page: Page) -> None:
     await page.get_by_text("Connected peer-to-peer").wait_for(timeout=TIMEOUT_S * 1000)
 
 
-async def drop_file(page: Page, name: str, size: int, seed: int) -> None:
-    """Drop a generated file on the drop zone, as a user dragging it in would."""
+async def drop_file(
+    page: Page, name: str, size: int, seed: int, last_modified: int = 1_000
+) -> None:
+    """Drop a generated file on the drop zone, as a user dragging it in would.
+    A fixed ``last_modified`` makes re-drops of the same file resumable."""
     # The zone accepts files only once the peer's hello has arrived
     await page.get_by_text("Drop files here").wait_for(timeout=TIMEOUT_S * 1000)
     await page.evaluate(
-        """([name, size, seed]) => {
+        """([name, size, seed, lastModified]) => {
             const bytes = new Uint8Array(size);
             for (let i = 0; i < size; i++) bytes[i] = (i * 31 + seed) % 256;
             const dt = new DataTransfer();
-            dt.items.add(new File([bytes], name));
+            dt.items.add(new File([bytes], name, { lastModified }));
             const zone = [...document.querySelectorAll("div")]
                 .find((d) => d.innerText?.startsWith("Drop files here"));
             zone.dispatchEvent(new DragEvent("drop", { dataTransfer: dt, bubbles: true }));
         }""",
-        [name, size, seed],
+        [name, size, seed, last_modified],
+    )
+
+
+async def wait_progress(page: Page, percent: int) -> None:
+    """Wait until a transfer row shows at least ``percent``% done."""
+    await page.wait_for_function(
+        """(min) => [...document.body.innerText.matchAll(/(\\d+)% ·/g)]
+                .some((m) => Number(m[1]) >= min)""",
+        arg=percent,
+        timeout=TIMEOUT_S * 1000,
     )
 
 
@@ -307,3 +321,68 @@ async def test_browser_to_browser(server: str, browser: Browser):
 
     expected = hashlib.sha256(pattern_bytes(3_000_000, seed=7)).hexdigest()
     assert await received_sha256(bob, "between-browsers.bin") == expected
+
+
+# ── Resume (#17) ────────────────────────────────────────────────────
+
+
+async def test_browser_to_cli_resumes_after_page_closes(
+    server: str, browser: Browser, tmp_path: Path
+):
+    size = 40_000_000
+    page = await browser.new_page()
+    room = await create_room(page, server)
+    cli = await Cli.start(server, "receive", room, "--out", str(tmp_path))
+    try:
+        await drop_file(page, "big.bin", size, seed=3)
+        await wait_progress(page, 20)
+        await page.close()  # the connection drops mid-transfer
+        assert await cli.exit_code() == 1, cli.output()
+        assert list((tmp_path / ".whoosh-partial").glob("*.part")), "partial was not kept"
+    finally:
+        await cli.close()
+
+    page = await browser.new_page()
+    room = await create_room(page, server)
+    cli = await Cli.start(server, "receive", room, "--out", str(tmp_path))
+    try:
+        await drop_file(page, "big.bin", size, seed=3)  # same file again
+        await page.get_by_text("Delivered").wait_for(timeout=TIMEOUT_S * 1000)
+        await page.get_by_role("button", name="Leave").click()
+        assert await cli.exit_code() == 0, cli.output()
+        assert "resuming from" in cli.output()
+        assert (tmp_path / "big.bin").read_bytes() == pattern_bytes(size, seed=3)
+        assert not (tmp_path / ".whoosh-partial").exists()
+    finally:
+        await cli.close()
+
+
+async def test_cli_to_browser_resumes_after_cli_is_killed(
+    server: str, browser: Browser, tmp_path: Path
+):
+    src = tmp_path / "big.bin"
+    src.write_bytes(os.urandom(120_000_000))
+    page = await browser.new_page()
+
+    cli = await Cli.start(server, "send", str(src))
+    try:
+        room = (await cli.wait_for(r"Room created: ([0-9a-f]{8})"))[1]
+        await page.goto(f"{server}/#{room}")
+        await wait_progress(page, 20)
+        cli.proc.kill()  # the sender vanishes mid-transfer
+        await page.get_by_text("The other person left").wait_for(timeout=TIMEOUT_S * 1000)
+    finally:
+        await cli.close()
+
+    # Same tab, new room: the browser still holds the partial in memory
+    cli = await Cli.start(server, "send", str(src))
+    try:
+        room = (await cli.wait_for(r"Room created: ([0-9a-f]{8})"))[1]
+        await page.goto(f"{server}/#{room}")
+        digest = await received_sha256(page, src.name)
+        assert digest == hashlib.sha256(src.read_bytes()).hexdigest()
+        assert await cli.exit_code() == 0, cli.output()
+        assert "resuming from" in cli.output()
+        assert await page.get_by_text("resumed from").count() >= 1
+    finally:
+        await cli.close()

@@ -11,6 +11,10 @@ const GATHER_TIMEOUT_MS = 5_000;
 /** drain() blocks above HIGH and resumes at LOW — same as packages/rtc. */
 const HIGH_WATER_BYTES = 1024 * 1024;
 const LOW_WATER_BYTES = 256 * 1024;
+/** A connection "disconnected" this long is treated as gone. ICE recovers
+ * from brief blips by itself; a peer that crashed never comes back, and its
+ * DataChannel would otherwise never fire "close". */
+const DISCONNECT_GRACE_MS = 8_000;
 
 export class ConnectError extends Error {}
 
@@ -36,6 +40,9 @@ async function fetchIceServers(): Promise<RTCIceServer[]> {
 /** RTCDataChannel with the send/drain/recv interface the session uses. */
 export class PeerChannel implements Channel {
   private lowWaiters: (() => void)[] = [];
+  private closeListeners: (() => void)[] = [];
+  private closed = false;
+  private disconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     readonly dc: RTCDataChannel,
@@ -44,11 +51,19 @@ export class PeerChannel implements Channel {
     dc.binaryType = "arraybuffer";
     dc.bufferedAmountLowThreshold = LOW_WATER_BYTES;
     dc.addEventListener("bufferedamountlow", () => this.wake());
-    dc.addEventListener("close", () => this.wake());
+    dc.addEventListener("close", () => this.markClosed());
+    pc.addEventListener("connectionstatechange", () => this.watchConnection());
+  }
+
+  /** Called once when the channel ends: closed by either side, or the peer
+   * stopped responding (see DISCONNECT_GRACE_MS). */
+  onClose(listener: () => void): void {
+    if (this.closed) listener();
+    else this.closeListeners.push(listener);
   }
 
   send(data: string | Uint8Array): void {
-    if (this.dc.readyState !== "open") throw new ConnectionClosedError();
+    if (this.closed || this.dc.readyState !== "open") throw new ConnectionClosedError();
     if (typeof data === "string") this.dc.send(data);
     // The cast narrows away SharedArrayBuffer-backed views, which we never create
     else this.dc.send(data as Uint8Array<ArrayBuffer>);
@@ -56,7 +71,7 @@ export class PeerChannel implements Channel {
 
   async drain(): Promise<void> {
     for (;;) {
-      if (this.dc.readyState !== "open") throw new ConnectionClosedError();
+      if (this.closed || this.dc.readyState !== "open") throw new ConnectionClosedError();
       if (this.dc.bufferedAmount <= HIGH_WATER_BYTES) return;
       await new Promise<void>((resolve) => this.lowWaiters.push(resolve));
     }
@@ -65,6 +80,29 @@ export class PeerChannel implements Channel {
   close(): void {
     this.dc.close();
     this.pc.close();
+    this.markClosed();
+  }
+
+  private watchConnection(): void {
+    const state = this.pc.connectionState;
+    if (state === "failed" || state === "closed") {
+      this.markClosed();
+    } else if (state === "disconnected") {
+      this.disconnectTimer ??= setTimeout(() => this.markClosed(), DISCONNECT_GRACE_MS);
+    } else {
+      clearTimeout(this.disconnectTimer);
+      this.disconnectTimer = undefined;
+    }
+  }
+
+  private markClosed(): void {
+    if (this.closed) return;
+    this.closed = true;
+    clearTimeout(this.disconnectTimer);
+    this.wake();
+    if (this.pc.connectionState !== "closed") this.pc.close();
+    for (const listener of this.closeListeners) listener();
+    this.closeListeners = [];
   }
 
   private wake(): void {

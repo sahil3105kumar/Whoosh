@@ -371,9 +371,14 @@ function Files({
 function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: () => void }) {
   const pct = t.size ? (100 * t.bytesDone) / t.size : 100;
   const seconds = (performance.now() - t.startedAt) / 1000;
-  const speed = seconds > 0.5 ? t.bytesDone / seconds : 0;
+  // Speed counts this session's bytes only, not what a resume skipped
+  const moved = t.bytesDone - t.resumedFrom;
+  const speed = seconds > 0.5 ? moved / seconds : 0;
   const rate = speed ? `${formatBytes(speed)}/s` : "";
   const eta = speed ? formatDuration((t.size - t.bytesDone) / speed) : "";
+  const resumed = t.resumedFrom
+    ? `resumed from ${((100 * t.resumedFrom) / (t.size || 1)).toFixed(0)}%`
+    : "";
   const arrow = t.direction === "send" ? "↑" : "↓";
 
   return (
@@ -395,7 +400,8 @@ function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: 
           </div>
           <div className="mt-1 flex items-center text-xs text-slate-500 dark:text-slate-400">
             <span className="flex-1">
-              {pct.toFixed(0)}% {rate && `· ${rate}`} {eta && `· ${eta} left`}
+              {pct.toFixed(0)}% {rate && `· ${rate}`} {eta && `· ${eta} left`}{" "}
+              {resumed && `· ${resumed}`}
             </span>
             <button className="hover:text-red-600" onClick={onCancel}>
               Cancel
@@ -408,6 +414,7 @@ function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: 
         <div className="mt-1 flex items-center text-xs">
           <span className="flex-1 text-emerald-600 dark:text-emerald-400">
             {t.direction === "send" ? "Delivered" : "Received · verified"}
+            {resumed && <span className="text-slate-500 dark:text-slate-400"> · {resumed}</span>}
           </span>
           {t.url && (
             <a

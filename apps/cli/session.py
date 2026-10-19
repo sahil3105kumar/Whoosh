@@ -34,7 +34,7 @@ from packages.transfer.manager import Direction, Transfer, TransferManager, Tran
 
 log = logging.getLogger(__name__)
 
-CAPABILITIES = [Capability.CHAT, Capability.FILE_TRANSFER, Capability.CANCEL]
+CAPABILITIES = [Capability.CHAT, Capability.FILE_TRANSFER, Capability.CANCEL, Capability.RESUME]
 
 
 def format_bytes(n: float) -> str:
@@ -116,12 +116,18 @@ class Ui:
         arrow = self.style.accent("↑" if t.direction is Direction.SEND else "↓")
         started = self._started.setdefault(t.id, time.monotonic())
         elapsed = max(time.monotonic() - started, 1e-6)
-        speed = t.bytes_done / elapsed
+        sent_now = t.bytes_done - t.resumed_from  # speed counts this session only
+        speed = sent_now / elapsed
 
         if t.status is TransferStatus.STREAMING:
+            if t.bytes_done == t.resumed_from:  # first report for this transfer
+                note = ""
+                if t.resumed_from:
+                    pct = 100 * t.resumed_from / t.size
+                    note = f", resuming from {pct:.0f}%"
+                if not self._tty or note:
+                    self.line(f"{arrow} {t.filename} ({format_bytes(t.size)}{note})...")
             if not self._tty:
-                if t.bytes_done == 0:
-                    self.line(f"{arrow} {t.filename} ({format_bytes(t.size)})...")
                 return
             self._draw_progress(arrow, t, speed)
             return
@@ -130,8 +136,10 @@ class Ui:
         if t.status is TransferStatus.COMPLETED:
             where = f"saved to {t.path}" if t.direction is Direction.RECEIVE else "delivered"
             details = format_bytes(t.size)
-            if t.size >= 1024 * 1024:  # below this, setup time dominates the "speed"
-                details += f", {format_bytes(t.size / elapsed)}/s"
+            if sent_now >= 1024 * 1024:  # below this, setup time dominates the "speed"
+                details += f", {format_bytes(sent_now / elapsed)}/s"
+            if t.resumed_from:
+                details += f", resumed from {100 * t.resumed_from / t.size:.0f}%"
             self.line(f"{arrow} {t.filename}: {self.style.ok(where)} {self.style.dim(details)}")
         else:
             self.error(f"{t.filename}: {t.status} ({t.reason})")

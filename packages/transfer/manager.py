@@ -3,14 +3,22 @@ File transfer over a DataChannel, in both directions.
 
 Wire sequence for one file (sender → receiver unless noted):
 
-    file_metadata        JSON   id, name, size, mime type
+    file_metadata        JSON   id, name, size, mime type, [resume_key]
+    transfer_accept      JSON   receiver → sender, only if resume_key was
+                                sent: the offset to start from
     chunk frames         binary see frames.py, strictly in offset order
     transfer_complete    JSON   sha256 of the whole file
     transfer_complete    JSON   receiver → sender, once verified and saved
 
 Either side may send ``transfer_cancel`` (with a reason) at any point;
 that ends the transfer for both. The channel is reliable and ordered,
-so chunks need no acknowledgement in v1.
+so chunks need no acknowledgement.
+
+Resume (docs/decisions.md D46–D47): when the peer advertised the
+``resume`` capability, the sender includes a ``resume_key``. A receiver
+holding a partial copy under that key answers with its length and the
+sender streams only the rest. Partials survive a lost connection and
+are deleted on cancel or on any integrity failure.
 
 This module knows nothing about aiortc: it talks to anything with
 ``send()`` and ``drain()`` (see ``Channel``), which WebRTCPeer provides.
@@ -30,7 +38,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import IO, Protocol
+from typing import IO, Any, Protocol
 
 from packages.protocol.codec import encode
 from packages.protocol.enums import MessageType
@@ -38,18 +46,24 @@ from packages.protocol.models import (
     FileMetadataPayload,
     Payload,
     ProtocolMessage,
+    TransferAcceptPayload,
     TransferCancelPayload,
     TransferCompletePayload,
     make_message,
 )
-from packages.transfer.filenames import part_path, safe_filename, unique_path
+from packages.transfer.filenames import safe_filename, unique_path
 from packages.transfer.frames import CHUNK_SIZE, decode_frame, encode_chunk
+from packages.transfer.resume import SAMPLE, PartialStore, is_resume_key, resume_key
 
 logger = logging.getLogger(__name__)
 
 #: How long a sender waits for the receiver to confirm a fully sent file.
 #: Covers draining the last buffered bytes plus hashing on the far side.
 DEFAULT_CONFIRM_TIMEOUT = 60.0
+
+#: How long a sender waits for transfer_accept. The receiver may first
+#: re-hash a large partial from disk.
+DEFAULT_ACCEPT_TIMEOUT = 60.0
 
 #: Minimum seconds between progress callbacks for one transfer.
 _REPORT_INTERVAL = 0.1
@@ -84,17 +98,27 @@ class Transfer:
     filename: str
     size: int
     #: Source file when sending; destination when receiving (final
-    #: name once completed — data goes to a .part file until then).
+    #: name once completed — data goes to a partial file until then).
     path: Path
     bytes_done: int = 0
+    #: Bytes that were already in place when this transfer started.
+    resumed_from: int = 0
     status: TransferStatus = TransferStatus.STREAMING
     reason: str = ""
 
     _done: asyncio.Future[None] = field(
         default_factory=lambda: asyncio.get_running_loop().create_future(), repr=False
     )
+    #: Sender: resolved with the receiver's starting offset.
+    _accepted: asyncio.Future[int] = field(
+        default_factory=lambda: asyncio.get_running_loop().create_future(), repr=False
+    )
     _hash: hashlib._Hash = field(default_factory=hashlib.sha256, repr=False)
     _file: IO[bytes] | None = field(default=None, repr=False)
+    #: Receiver: name of the partial in the PartialStore, and whether it
+    #: may outlive a lost connection (only resumable ones do).
+    _partial: str | None = field(default=None, repr=False)
+    _resumable: bool = field(default=False, repr=False)
     _last_report: float = field(default=0.0, repr=False)
 
 
@@ -106,12 +130,17 @@ class TransferManager:
         *,
         on_update: Callable[[Transfer], None] | None = None,
         confirm_timeout: float = DEFAULT_CONFIRM_TIMEOUT,
+        accept_timeout: float = DEFAULT_ACCEPT_TIMEOUT,
     ) -> None:
         self._channel = channel
         self._download_dir = download_dir
+        self._partials = PartialStore(download_dir)
         self._on_update = on_update
         self._confirm_timeout = confirm_timeout
+        self._accept_timeout = accept_timeout
         self._transfers: dict[str, Transfer] = {}
+        with contextlib.suppress(OSError):
+            self._partials.cleanup()
 
     @property
     def transfers(self) -> list[Transfer]:
@@ -119,8 +148,11 @@ class TransferManager:
 
     # ── Sending ─────────────────────────────────────────────────────
 
-    async def send_file(self, path: Path) -> Transfer:
+    async def send_file(self, path: Path, *, resume: bool = False) -> Transfer:
         """Stream ``path`` to the peer and wait for its confirmation.
+
+        ``resume``: the peer advertised the resume capability, so offer a
+        resume key and start wherever the receiver says.
 
         Returns the finished Transfer; check ``status`` for the outcome.
         Raises OSError only if the file can't be opened at all.
@@ -145,10 +177,16 @@ class TransferManager:
                         filename=transfer.filename,
                         size=size,
                         mime_type=mime_type,
+                        resume_key=resume_key(path) if resume else None,
                     ),
                 )
+                offset = await self._await_accept(transfer) if resume else 0
+                if transfer.status.finished:
+                    return transfer
+                if offset:
+                    self._skip_prefix(transfer, f, offset)
                 self._report(transfer, force=True)
-                await self._stream(transfer, f)
+                await self._stream(transfer, f, offset)
 
                 if not transfer.status.finished:
                     self._send(
@@ -168,8 +206,36 @@ class TransferManager:
 
         return transfer
 
-    async def _stream(self, transfer: Transfer, f: IO[bytes]) -> None:
-        offset = 0
+    async def _await_accept(self, transfer: Transfer) -> int:
+        """Wait for transfer_accept (or for the transfer to end first)."""
+        waiters: set[asyncio.Future[Any]] = {transfer._accepted, transfer._done}
+        done, _ = await asyncio.wait(
+            waiters, timeout=self._accept_timeout, return_when=asyncio.FIRST_COMPLETED
+        )
+        if not done:
+            self._fail(transfer, "receiver did not answer the transfer offer")
+            return 0
+        if transfer.status.finished:
+            return 0
+        offset = transfer._accepted.result()
+        if not 0 <= offset <= transfer.size:
+            self._fail(transfer, f"receiver asked for an invalid offset {offset}")
+            return 0
+        return offset
+
+    def _skip_prefix(self, transfer: Transfer, f: IO[bytes], offset: int) -> None:
+        """Hash the part the receiver already has, without sending it: the
+        final sha256 covers the whole file."""
+        remaining = offset
+        while remaining:
+            block = f.read(min(remaining, SAMPLE))
+            if not block:
+                raise OSError("file shrank since the transfer was offered")
+            transfer._hash.update(block)
+            remaining -= len(block)
+        transfer.bytes_done = transfer.resumed_from = offset
+
+    async def _stream(self, transfer: Transfer, f: IO[bytes], offset: int) -> None:
         while chunk := f.read(CHUNK_SIZE):
             await self._channel.drain()
             # Either side may have cancelled while we waited for the buffer
@@ -195,6 +261,14 @@ class TransferManager:
         payload = msg.payload
         if isinstance(payload, FileMetadataPayload):
             self._start_receive(payload)
+        elif isinstance(payload, TransferAcceptPayload):
+            transfer = self._active(payload.transfer_id)
+            if (
+                transfer is not None
+                and transfer.direction is Direction.SEND
+                and not transfer._accepted.done()
+            ):
+                transfer._accepted.set_result(payload.offset)
         elif isinstance(payload, TransferCompletePayload):
             self._handle_complete(payload)
         elif isinstance(payload, TransferCancelPayload):
@@ -242,29 +316,59 @@ class TransferManager:
         if meta.size < 0:
             self._reject(meta.transfer_id, "invalid size")
             return
+        if meta.resume_key is not None and not is_resume_key(meta.resume_key):
+            self._reject(meta.transfer_id, "invalid resume key")
+            return
+
+        # Resume under the sender's key, unless another active transfer is
+        # already writing that partial (the same file sent twice at once)
+        key = meta.resume_key
+        in_use = {t._partial for t in self._transfers.values() if not t.status.finished}
+        resumable = key is not None and key not in in_use
+        partial = key if resumable and key is not None else transfer_id
+        offset = self._partials.existing(partial, meta.size) if resumable else 0
 
         self._download_dir.mkdir(parents=True, exist_ok=True)
-        if shutil.disk_usage(self._download_dir).free < meta.size:
+        if shutil.disk_usage(self._download_dir).free < meta.size - offset:
             self._reject(meta.transfer_id, "not enough disk space on receiver")
             return
 
-        filename = safe_filename(meta.filename)
-        dest = unique_path(self._download_dir, filename)
+        hasher = hashlib.sha256()
+        if offset:
+            try:
+                self._partials.hash_prefix(partial, offset, hasher)
+            except OSError:
+                # Unreadable partial: start over rather than fail
+                self._partials.discard(partial)
+                hasher, offset = hashlib.sha256(), 0
         try:
-            file = part_path(dest).open("xb")
+            file = self._partials.open(partial, meta.size, offset)
         except OSError as exc:
             self._reject(meta.transfer_id, f"cannot create file: {exc}")
             return
 
+        filename = safe_filename(meta.filename)
         transfer = Transfer(
             id=transfer_id,
             direction=Direction.RECEIVE,
             filename=filename,
             size=meta.size,
-            path=dest,
+            path=unique_path(self._download_dir, filename),  # re-checked on completion
+            bytes_done=offset,
+            resumed_from=offset,
+            _hash=hasher,
             _file=file,
+            _partial=partial,
+            _resumable=resumable,
         )
+
         self._transfers[transfer_id] = transfer
+        if key is not None:
+            # The sender offered resume, so it waits for our answer
+            self._send(
+                MessageType.TRANSFER_ACCEPT,
+                TransferAcceptPayload(transfer_id=meta.transfer_id, offset=offset),
+            )
         self._report(transfer, force=True)
 
     def _handle_complete(self, payload: TransferCompletePayload) -> None:
@@ -284,7 +388,7 @@ class TransferManager:
             self._fail(transfer, "checksum mismatch")
             return
 
-        assert transfer._file is not None
+        assert transfer._file is not None and transfer._partial is not None
         transfer._file.close()
         transfer._file = None
         # The name may have been taken while we were receiving
@@ -292,7 +396,7 @@ class TransferManager:
         if final.exists():
             final = unique_path(final.parent, final.name)
         try:
-            part_path(transfer.path).rename(final)
+            self._partials.finish(transfer._partial, final)
         except OSError as exc:
             self._fail(transfer, f"cannot save file: {exc}")
             return
@@ -314,10 +418,12 @@ class TransferManager:
 
     def close(self, reason: str = "connection closed") -> None:
         """Fail every active transfer without notifying the peer — call
-        when the channel is gone."""
+        when the channel is gone. Resumable partials are kept."""
         for transfer in list(self._transfers.values()):
             if not transfer.status.finished:
-                self._finish(transfer, TransferStatus.FAILED, reason, notify=False)
+                self._finish(
+                    transfer, TransferStatus.FAILED, reason, notify=False, keep_partial=True
+                )
 
     # ── Internals ───────────────────────────────────────────────────
 
@@ -333,8 +439,17 @@ class TransferManager:
         self._finish(transfer, TransferStatus.FAILED, reason, notify=True)
 
     def _finish(
-        self, transfer: Transfer, status: TransferStatus, reason: str = "", *, notify: bool
+        self,
+        transfer: Transfer,
+        status: TransferStatus,
+        reason: str = "",
+        *,
+        notify: bool,
+        keep_partial: bool = False,
     ) -> None:
+        """End a transfer. A receiver's partial data is deleted unless
+        ``keep_partial`` and it's resumable: cancels and integrity failures
+        must not leave data behind to be resumed."""
         if transfer.status.finished:
             return
         transfer.status = status
@@ -343,7 +458,8 @@ class TransferManager:
         if transfer._file is not None:
             transfer._file.close()
             transfer._file = None
-            part_path(transfer.path).unlink(missing_ok=True)
+            if transfer._partial is not None and not (keep_partial and transfer._resumable):
+                self._partials.discard(transfer._partial)
 
         if notify:
             with contextlib.suppress(ConnectionError):

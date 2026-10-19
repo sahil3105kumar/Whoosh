@@ -43,6 +43,18 @@ class FileMetadataPayload(Payload):
     filename: str
     size: int
     mime_type: str = "application/octet-stream"
+    #: Set only when the receiver advertised ``resume``: identifies the
+    #: file across sessions so a partial copy can be continued. The
+    #: receiver must answer with ``transfer_accept``.
+    resume_key: str | None = None
+
+
+class TransferAcceptPayload(Payload):
+    """Receiver's answer to a file_metadata carrying a resume_key: start at
+    ``offset`` (bytes it already holds; 0 = from the beginning)."""
+
+    transfer_id: str
+    offset: int
 
 
 class ProgressPayload(Payload):
@@ -102,6 +114,7 @@ AnyPayload = Annotated[
     | ProgressPayload
     | TransferCompletePayload
     | TransferCancelPayload
+    | TransferAcceptPayload
     | ErrorPayload
     | PingPayload
     | PongPayload,

@@ -71,9 +71,9 @@ def test_safe_filename_truncates_long_names_keeping_extension():
     assert name.endswith(".gz")
 
 
-def test_unique_path_skips_existing_and_partial_files(tmp_path: Path):
+def test_unique_path_skips_existing_files(tmp_path: Path):
     (tmp_path / "a.txt").touch()
-    (tmp_path / "a (1).txt.part").touch()
+    (tmp_path / "a (1).txt").touch()
     assert unique_path(tmp_path, "a.txt") == tmp_path / "a (2).txt"
 
 

@@ -204,7 +204,7 @@ def _parse_paths(arg: str, ui: Ui) -> list[Path]:
 
 async def _send_one(session: Session, path: Path, ui: Ui) -> None:
     try:
-        await session.transfers.send_file(path)
+        await session.transfers.send_file(path, resume=session.peer_can(Capability.RESUME))
     except OSError as exc:
         ui.error(f"{path}: {exc}")
 
@@ -225,7 +225,9 @@ async def _send_files(session: Session, paths: list[Path], ui: Ui) -> bool:
         for i, path in enumerate(paths, 1):
             if len(paths) > 1:
                 ui.hint(f"File {i} of {len(paths)}")
-            transfer = await session.transfers.send_file(path)
+            transfer = await session.transfers.send_file(
+                path, resume=session.peer_can(Capability.RESUME)
+            )
             ok &= transfer.status is TransferStatus.COMPLETED
             if inbound.done():
                 break  # channel closed; remaining files can't go

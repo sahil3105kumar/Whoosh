@@ -562,3 +562,65 @@ server is used unless `--server` is given (precedence: `--server`, link,
 ("Room x doesn't exist… rooms expire after 10 minutes").
 **Why** — Scripts and logs shouldn't get escape codes. Pasting the link someone
 sent you should just work, without knowing which server it came from.
+
+---
+
+## v2.0 — Reliable transfers
+
+### D46. Resume: sampled resume key, `transfer_accept`, negotiated capability
+*2026-10-19 — #17*
+
+**Decision** — When both peers advertise `resume`, `file_metadata`
+carries a `resume_key`: SHA-256 over the size, modification time, and
+first and last 1 MiB of the file (spec in protocol.md, with shared
+reference vectors in both test suites). The receiver answers
+`transfer_accept {offset}` with the bytes it already holds; the sender
+hashes that prefix locally and streams the rest. The protocol version
+stays 1.
+**Why** —
+- *Not a full-file hash:* that would read huge files twice before
+  sending a byte. A false match is harmless because the end-to-end
+  SHA-256 (D17) still has to pass.
+- *Byte offset:* chunk frames already carry byte offsets, chosen for
+  exactly this (D12).
+- *Capability, not version:* the new fields are additive and only used
+  when both sides opt in, so mixed clients keep working.
+- *Diverges from #17's wording* ("last acked chunk index", a
+  `transfer_resume` message): the receiver's own byte count is the
+  ground truth of what landed, so it needs no ack bookkeeping to resume.
+**Revisit** — If files are often modified in place between attempts and
+users expect resume anyway (the key changes with mtime).
+
+### D47. Where partials live, and when they're kept
+*2026-10-19 — #17*
+
+**Decision** —
+- *CLI:* partials are stored on disk in
+  `<download dir>/.whoosh-partial/<key>.part` with a `.json` sidecar
+  recording the size. They survive restarts, untouched ones are deleted
+  after 7 days, and the folder disappears when empty.
+- *Web:* partials stay in memory for the life of the tab, with the hash
+  state kept so resuming doesn't re-read data.
+- *Keep vs. discard:* a partial is kept when the connection drops, and
+  deleted on cancel (by either side) or any integrity failure
+  (checksum, offset, overflow). Transfers from senders without resume
+  never keep partials.
+
+**Why** — A cancel is a decision not to have the file; integrity failures
+mean the partial can't be trusted. Web persistence across reloads would
+need OPFS or IndexedDB and a quota story; in-tab covers the common
+case of a peer's network dropping.
+**Revisit** — Web persistence across reloads (OPFS).
+
+### D48. A peer that stops responding counts as gone
+*2026-10-19 — found while testing #17*
+
+**Decision** — Both clients treat the connection as closed when ICE
+reports `failed`; the web client also after `disconnected` for 8s. A
+single "closed" latch in each client feeds the session, whichever
+signal fires first.
+**Why** — A peer that crashes or loses its network never closes the
+DataChannel, so its "close" event may never arrive: the interop test
+that kills the CLI mid-transfer left the browser waiting indefinitely.
+ICE consent checks are the only signal. 8s rides out brief blips,
+which ICE recovers from by itself.
