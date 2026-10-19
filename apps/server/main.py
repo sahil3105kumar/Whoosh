@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -285,10 +289,13 @@ class IceServer(BaseModel):
     """Same shape as the browser's RTCIceServer dictionary."""
 
     urls: list[str]
+    username: str | None = None
+    credential: str | None = None
 
 
 class ClientConfigResponse(BaseModel):
     ice_servers: list[IceServer]
+    ice_transport_policy: str = "all"
 
 
 @app.get("/config")
@@ -299,7 +306,25 @@ async def client_config() -> ClientConfigResponse:
     client) means adding TURN later is a server config change only.
     """
     ice_servers = [IceServer(urls=list(settings.stun_urls))] if settings.stun_urls else []
-    return ClientConfigResponse(ice_servers=ice_servers)
+    if settings.turn_urls and settings.turn_secret:
+        username, credential = turn_credentials(settings.turn_secret, settings.turn_ttl_seconds)
+        ice_servers.append(
+            IceServer(urls=list(settings.turn_urls), username=username, credential=credential)
+        )
+    return ClientConfigResponse(
+        ice_servers=ice_servers, ice_transport_policy=settings.ice_transport_policy
+    )
+
+
+def turn_credentials(secret: str, ttl_seconds: int, *, now: float | None = None) -> tuple[str, str]:
+    """Short-lived TURN credentials (the "TURN REST API" scheme coturn
+    implements with use-auth-secret): username is the expiry timestamp,
+    credential is base64(HMAC-SHA1(secret, username)). The TURN server
+    checks them with the same secret; clients never see it (D59)."""
+    expiry = int((now if now is not None else time.time()) + ttl_seconds)
+    username = f"{expiry}:{secrets.token_hex(4)}"
+    digest = hmac.new(secret.encode(), username.encode(), hashlib.sha1).digest()
+    return username, base64.b64encode(digest).decode()
 
 
 @app.get("/healthz")

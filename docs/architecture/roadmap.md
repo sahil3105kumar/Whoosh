@@ -178,3 +178,4 @@ choices that differ from an issue's wording are recorded in
 | Issue | Implementation | Verified by |
 |---|---|---|
 | #28 Password-protected rooms | Optional password at creation, scrypt hash, `auth` as first WebSocket message, 5 tries/min (D58); CLI `--password`, web create field and join prompt | `tests/server/test_ws_signaling.py`, `test_password_protected_room` (mesh + interop) |
+| #31 TURN relay fallback | Short-lived TURN credentials in `/config`, optional relay-only policy, opt-in coturn service with private-range blocking (D59) | `tests/server/test_rooms.py`, `tests/interop/test_turn.py` (real coturn, relay-only, candidate type checked) |

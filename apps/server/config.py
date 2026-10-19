@@ -39,6 +39,15 @@ class Settings:
     #: STUN server URLs handed to clients via GET /config. Clients learn
     #: their public address from these; TURN would go here too (v4.0).
     stun_urls: tuple[str, ...] = ("stun:stun.l.google.com:19302",)
+    #: TURN relay (#31): server URLs, and the secret shared with the TURN
+    #: server for short-lived credentials (coturn's static-auth-secret).
+    turn_urls: tuple[str, ...] = ()
+    turn_secret: str | None = None
+    #: How long issued TURN credentials stay valid.
+    turn_ttl_seconds: int = 3600
+    #: "all" (default) or "relay": make browsers use only the relay, which
+    #: hides peers' IP addresses from each other at the cost of bandwidth.
+    ice_transport_policy: str = "all"
     #: Built web client (apps/web/dist) to serve at /. None = API only.
     web_dir: str | None = None
 
@@ -62,6 +71,10 @@ class Settings:
                 _csv(env["WHOOSH_STUN_URLS"]) if "WHOOSH_STUN_URLS" in env else defaults.stun_urls
             ),
             web_dir=env.get("WHOOSH_WEB_DIR") or None,
+            turn_urls=_csv(env.get("WHOOSH_TURN_URLS", "")),
+            turn_secret=env.get("WHOOSH_TURN_SECRET") or None,
+            turn_ttl_seconds=int(env.get("WHOOSH_TURN_TTL_SECONDS", defaults.turn_ttl_seconds)),
+            ice_transport_policy=env.get("WHOOSH_ICE_TRANSPORT_POLICY", "all"),
         )
 
     def origin_allowed(self, origin: str | None) -> bool:

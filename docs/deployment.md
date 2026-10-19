@@ -73,6 +73,33 @@ Set in `docker/.env`; see `docker/.env.example` and
 | `WHOOSH_ROOM_CREATE_PER_MINUTE` | `10` | Per client IP |
 | `WHOOSH_LOG_LEVEL` | `INFO` | |
 
+## TURN relay (optional)
+
+Some networks (symmetric NATs, strict corporate firewalls) block direct
+peer-to-peer connections; Whoosh then reports "Direct connection
+failed". A TURN relay fixes that by forwarding the (still encrypted)
+traffic.
+
+1. In `docker/.env` set a long random secret and the relay's URLs:
+
+   ```bash
+   WHOOSH_TURN_SECRET=<output of: openssl rand -hex 32>
+   WHOOSH_TURN_URLS=turn:your.domain:3478?transport=udp,turn:your.domain:3478?transport=tcp
+   ```
+
+2. Open inbound **3478** UDP and TCP, and UDP **49160–49200** (the
+   relay ports) on the VPS.
+3. Start the stack with the `turn` profile:
+
+   ```bash
+   docker compose -f docker/compose.yaml --profile turn up -d --build
+   ```
+
+Credentials handed to clients expire after an hour; the secret itself
+never leaves the server. To also hide peers' IP addresses from each
+other (at the cost of relaying everything), set
+`WHOOSH_ICE_TRANSPORT_POLICY=relay`.
+
 ## Operating
 
 ```bash
@@ -92,9 +119,9 @@ re-requests certificates and can hit Let's Encrypt rate limits.
 
 * **Certificate errors / Caddy logs ACME failures**: DNS doesn't point
   at this server yet, or ports 80/443 are blocked.
-* **`whoosh` says "Direct connection failed"**: signaling worked but the
-  peers can't reach each other. One side is behind a strict NAT and
-  would need a TURN relay, which v1 doesn't include (D11).
+* **"Direct connection failed"**: signaling worked but the peers can't
+  reach each other. Enable the TURN relay (above), and check its ports
+  are open.
 * **Rate limit hits everyone at once**: the app is seeing Caddy's IP
   instead of clients'. Check the app port isn't being reached some other
   way and that uvicorn still runs with `--proxy-headers` (Dockerfile).

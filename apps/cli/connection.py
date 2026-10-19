@@ -105,13 +105,21 @@ def room_needs_password(server: str, room_id: str) -> bool:
 def _fetch_rtc_config(server: str) -> RTCConfiguration:
     with urllib.request.urlopen(f"{server}/config") as resp:
         ice_servers = json.loads(resp.read())["ice_servers"]
-    return RTCConfiguration(iceServers=[RTCIceServer(urls=s["urls"]) for s in ice_servers])
+    # TURN entries carry short-lived credentials (#31); aiortc can't be forced
+    # to relay-only, so the server's ice_transport_policy only applies to
+    # browsers
+    return RTCConfiguration(
+        iceServers=[
+            RTCIceServer(urls=s["urls"], username=s.get("username"), credential=s.get("credential"))
+            for s in ice_servers
+        ]
+    )
 
 
 DIRECT_FAILED = (
     "Direct connection failed: no network path between the peers. "
-    "One side is likely behind a strict NAT or firewall "
-    "(relay servers aren't supported yet)."
+    "One side is likely behind a strict NAT or firewall, and the server's "
+    "TURN relay is missing or unreachable."
 )
 
 

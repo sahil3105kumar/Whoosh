@@ -812,3 +812,29 @@ the code out of the room. It isn't an encryption key; confidentiality
 against the server itself comes from D59–D61.
 **Note** — The invite link deliberately doesn't carry the password:
 share it separately.
+
+### D59. TURN relay with short-lived credentials; optional coturn in the stack
+*2026-10-19 — #31*
+
+**Decision** — With `WHOOSH_TURN_URLS` and `WHOOSH_TURN_SECRET` set,
+`GET /config` adds a TURN server with credentials minted per request:
+`username = "<expiry>:<random>"`, `credential = base64(HMAC-SHA1(secret,
+username))`, valid for an hour (the "TURN REST API" scheme coturn
+implements with `use-auth-secret`). `docker/compose.yaml` gains an opt-in
+coturn service (`--profile turn`) that refuses to start without a secret
+and never relays into private or loopback address ranges.
+`WHOOSH_ICE_TRANSPORT_POLICY=relay` makes browsers use only the relay,
+hiding peers' IP addresses from each other.
+**Why** — Peers behind symmetric NATs can't connect directly (D11), and
+long-lived TURN passwords in clients would be scraped and abused. With
+expiring credentials, the secret stays between the signaling server and
+the TURN server. Relayed data is still DTLS-encrypted end to end (and,
+with D60, encrypted again at the application layer), so the relay sees
+only ciphertext.
+**Limits** — aiortc can't be told to use relay only, so the CLI ignores
+`relay` policy (it still uses TURN when needed). The open-relay abuse
+guard (`denied-peer-ip`) matters: without it, anyone with fresh
+credentials could relay into the server's own network.
+**Verified** — Against a real coturn: two relay-only browsers, and the
+CLI to a relay-only browser, connect with the selected candidate pair of
+type `relay`, and transfer files intact.

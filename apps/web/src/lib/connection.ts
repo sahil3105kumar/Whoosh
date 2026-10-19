@@ -43,10 +43,28 @@ export async function roomNeedsPassword(roomId: string): Promise<boolean> {
   return ((await resp.json()) as { password_required?: boolean }).password_required ?? false;
 }
 
-async function fetchIceServers(): Promise<RTCIceServer[]> {
+interface IceConfig {
+  iceServers: RTCIceServer[];
+  iceTransportPolicy: RTCIceTransportPolicy;
+}
+
+/** ICE servers (STUN, and TURN with short-lived credentials, #31) and
+ * whether to use only the relay. */
+async function fetchIceConfig(): Promise<IceConfig> {
   const resp = await fetch("/config");
   if (!resp.ok) throw new ConnectError(`Couldn't load server config (HTTP ${resp.status}).`);
-  return ((await resp.json()) as { ice_servers: RTCIceServer[] }).ice_servers;
+  const config = (await resp.json()) as {
+    ice_servers: { urls: string[]; username?: string | null; credential?: string | null }[];
+    ice_transport_policy?: string;
+  };
+  return {
+    iceServers: config.ice_servers.map(({ urls, username, credential }) => ({
+      urls,
+      ...(username ? { username } : {}),
+      ...(credential ? { credential } : {}),
+    })),
+    iceTransportPolicy: config.ice_transport_policy === "relay" ? "relay" : "all",
+  };
 }
 
 // ── DataChannel adapter ─────────────────────────────────────────────
@@ -194,7 +212,7 @@ interface Pair {
  */
 export class Mesh {
   peerId?: string;
-  private iceServers: RTCIceServer[] = [];
+  private ice: IceConfig = { iceServers: [], iceTransportPolicy: "all" };
   private ws?: WebSocket;
   private pairs = new Map<string, Pair>();
   private forgotten = new Set<string>();
@@ -209,7 +227,7 @@ export class Mesh {
   ) {}
 
   async start(signal: AbortSignal): Promise<void> {
-    this.iceServers = await fetchIceServers();
+    this.ice = await fetchIceConfig();
     // Bail before opening the socket: a cancelled attempt that reached the
     // server would hold a room slot (React StrictMode runs effects twice).
     if (signal.aborted) throw new ConnectError("Cancelled.");
@@ -377,7 +395,7 @@ export class Mesh {
   private newPeer(pair: Pair): RTCPeerConnection {
     pair.pc?.close();
     pair.ready = undefined;
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    const pc = new RTCPeerConnection(this.ice);
     pair.pc = pc;
     return pc;
   }
@@ -440,7 +458,7 @@ function connected(pair: Pair): boolean {
 
 const directFailedMessage =
   "Direct connection failed: no network path between the peers. One side is likely " +
-  "behind a strict NAT or firewall (relay servers aren't supported yet).";
+  "behind a strict NAT or firewall, and the server's TURN relay is missing or unreachable.";
 
 /** Resolve when ICE gathering completes, or after GATHER_TIMEOUT_MS with
  * whatever candidates were found by then. */

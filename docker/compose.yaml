@@ -13,6 +13,9 @@ services:
       WHOOSH_ALLOWED_ORIGINS: ${WHOOSH_ALLOWED_ORIGINS:-https://${WHOOSH_DOMAIN}}
       WHOOSH_LOG_LEVEL: ${WHOOSH_LOG_LEVEL:-INFO}
       WHOOSH_ROOM_CREATE_PER_MINUTE: ${WHOOSH_ROOM_CREATE_PER_MINUTE:-10}
+      # TURN relay (#31): set both to hand out short-lived credentials
+      WHOOSH_TURN_URLS: ${WHOOSH_TURN_URLS:-}
+      WHOOSH_TURN_SECRET: ${WHOOSH_TURN_SECRET:-}
     # Internal only. Never publish this port: uvicorn trusts forwarded
     # headers from any source, which is safe only behind Caddy (D30).
     expose:
@@ -34,6 +37,40 @@ services:
     depends_on:
       whoosh:
         condition: service_healthy
+
+  # Optional TURN relay for peers that can't connect directly (#31, D59).
+  # Start with: docker compose -f docker/compose.yaml --profile turn up -d
+  turn:
+    image: coturn/coturn:latest
+    profiles: [turn]
+    restart: unless-stopped
+    # Relays use a range of UDP ports; host networking avoids publishing
+    # each one through Docker's proxy
+    network_mode: host
+    environment:
+      TURN_SECRET: ${WHOOSH_TURN_SECRET:-}
+      TURN_REALM: ${WHOOSH_DOMAIN:-whoosh}
+    # Checked here rather than with ${VAR:?}: Compose interpolates every
+    # service, so a required variable would break the stack without TURN
+    entrypoint: [sh, -c]
+    command:
+      - |
+        [ -n "$$TURN_SECRET" ] || { echo "Set WHOOSH_TURN_SECRET in docker/.env" >&2; exit 1; }
+        # Never relay into private networks: an open relay could otherwise be
+        # used to reach machines behind the server's firewall
+        exec turnserver -n --log-file=stdout \
+          --listening-port=3478 --min-port=49160 --max-port=49200 \
+          --use-auth-secret --static-auth-secret="$$TURN_SECRET" --realm="$$TURN_REALM" \
+          --fingerprint --no-multicast-peers \
+          --denied-peer-ip=0.0.0.0-0.255.255.255 \
+          --denied-peer-ip=10.0.0.0-10.255.255.255 \
+          --denied-peer-ip=100.64.0.0-100.127.255.255 \
+          --denied-peer-ip=127.0.0.0-127.255.255.255 \
+          --denied-peer-ip=169.254.0.0-169.254.255.255 \
+          --denied-peer-ip=172.16.0.0-172.31.255.255 \
+          --denied-peer-ip=192.168.0.0-192.168.255.255 \
+          --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff \
+          --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 
 volumes:
   caddy_data:
