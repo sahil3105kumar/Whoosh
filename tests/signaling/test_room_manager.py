@@ -104,8 +104,8 @@ def test_second_peer_joins_transitions_to_connected():
     assert room.peer_ids == {"peer1", "peer2"}
 
 
-def test_third_peer_raises_room_full():
-    manager = RoomManager()
+def test_peer_beyond_capacity_raises_room_full():
+    manager = RoomManager(max_peers=2)
     room = manager.create_room()
 
     manager.join_room(room.id, "peer1")
@@ -190,3 +190,13 @@ def test_touch_extends_expiry():
 
 def test_touch_unknown_room_is_noop():
     RoomManager().touch("nope")
+
+
+def test_room_capacity_is_configurable():
+    manager = RoomManager(max_peers=3)
+    room = manager.create_room()
+    for peer in ("a", "b", "c"):
+        manager.join_room(room.id, peer)
+    assert room.state == RoomState.CONNECTED
+    with pytest.raises(RoomFullError):
+        manager.join_room(room.id, "d")

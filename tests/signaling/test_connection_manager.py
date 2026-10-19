@@ -57,8 +57,9 @@ async def test_connect_two_peers_transitions_to_connected(manager):
     assert room.peer_ids == {pid1, pid2}
 
 
-async def test_third_peer_raises_room_full(manager):
-    rm, cm = manager
+async def test_peer_beyond_capacity_raises_room_full():
+    rm = RoomManager(max_peers=2)
+    cm = ConnectionManager(rm, reconnect_grace_seconds=GRACE)
     room = rm.create_room()
 
     await cm.connect(room.id, _make_ws())

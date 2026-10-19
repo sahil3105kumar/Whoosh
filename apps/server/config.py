@@ -31,6 +31,8 @@ class Settings:
     allowed_origins: tuple[str, ...] = ()
     #: Rooms one client IP may create per minute.
     room_create_per_minute: int = 10
+    #: People per room. Each pair holds a WebRTC connection (full mesh).
+    max_peers: int = 8
     #: Largest signaling message accepted, in bytes. SDP is a few KB.
     max_message_bytes: int = 64 * 1024
     log_level: str = "INFO"
@@ -54,6 +56,7 @@ class Settings:
                 env.get("WHOOSH_ROOM_CREATE_PER_MINUTE", defaults.room_create_per_minute)
             ),
             max_message_bytes=int(env.get("WHOOSH_MAX_MESSAGE_BYTES", defaults.max_message_bytes)),
+            max_peers=int(env.get("WHOOSH_MAX_PEERS", defaults.max_peers)),
             log_level=env.get("WHOOSH_LOG_LEVEL", defaults.log_level).upper(),
             stun_urls=(
                 _csv(env["WHOOSH_STUN_URLS"]) if "WHOOSH_STUN_URLS" in env else defaults.stun_urls

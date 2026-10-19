@@ -141,6 +141,21 @@ class ConnectionManager:
         """Peers in ``room_id`` with a live WebSocket, other than ``excluding``."""
         return [pid for pid in self._connections.get(room_id, {}) if pid != excluding]
 
+    async def relay_to(
+        self, room_id: str, sender_id: str, target_id: str, message: dict[str, Any]
+    ) -> bool:
+        """Deliver ``message`` to one peer, stamped with who sent it.
+        False if that peer isn't connected right now."""
+        ws = self._connections.get(room_id, {}).get(target_id)
+        if ws is None:
+            return False
+        try:
+            await ws.send_json({**message, "from": sender_id})
+        except Exception:
+            logger.warning("relay to peer %s in room %s failed", target_id, room_id, exc_info=True)
+            return False
+        return True
+
     def active_rooms(self) -> list[str]:
         """Rooms with at least one connected WebSocket."""
         return list(self._connections)

@@ -39,7 +39,7 @@ RELAY_TYPES = frozenset({"offer", "answer", "ice"})
 # deployment); revisit if
 # this ever runs behind a multi-instance autoscaler — see the note
 # in room_manager.py.
-room_manager = RoomManager(ttl_seconds=settings.room_ttl_seconds)
+room_manager = RoomManager(ttl_seconds=settings.room_ttl_seconds, max_peers=settings.max_peers)
 connection_manager = ConnectionManager(
     room_manager, reconnect_grace_seconds=settings.reconnect_grace_seconds
 )
@@ -217,7 +217,16 @@ async def ws_signaling(
                     {"type": "error", "reason": f"cannot relay message type {msg_type!r}"}
                 )
                 continue
-            await connection_manager.relay(room_id, assigned_peer_id, data)
+            # Multi-peer rooms address signaling to one peer ("to"); the
+            # server stamps "from". Without "to" it goes to everyone (1:1).
+            target = data.get("to")
+            if isinstance(target, str):
+                if not await connection_manager.relay_to(room_id, assigned_peer_id, target, data):
+                    await websocket.send_json(
+                        {"type": "error", "reason": f"peer {target} is not connected"}
+                    )
+            else:
+                await connection_manager.relay(room_id, assigned_peer_id, data)
     except WebSocketDisconnect:
         pass
     except _CloseConnection as exc:
