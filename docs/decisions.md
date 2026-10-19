@@ -523,3 +523,42 @@ Browser → CLI ran at ~7.5 MB/s, against CLI → browser at ~32 MB/s and
 browser → browser at ~47 MB/s over localhost. The limit is on aiortc's
 receiving side, not the web client. Fine for v1; worth profiling if
 large uploads from the web are common.
+
+---
+
+## v1.1 — Usability
+
+### D43. Outgoing files queue and go one at a time
+*2026-10-19 — #14*
+
+**Decision** — Both clients keep an outgoing queue (`apps/web/src/lib/queue.ts`,
+`apps/cli/queue.py`): files are sent in the order added, one at a time, and
+waiting ones can be removed (web: **Remove**; CLI: `/queue`, `/cancel`). The
+queue is client-side only; the protocol is unchanged.
+**Why** — Previously each drop or `/send` started its own concurrent upload.
+Concurrent sends only split one DataChannel's bandwidth, so every file finished
+later than it would in sequence, and the progress of several half-done files is
+harder to follow than one active file plus a list.
+**Revisit** — If many tiny files need batching: per-file round trips
+(metadata → confirm) will dominate.
+
+### D44. The whole room page is a drop target
+*2026-10-19 — #13*
+
+**Decision** — While connected, files dropped anywhere on the page are queued,
+with a full-page "Drop to send" overlay during the drag. The drop box stays as a
+visual hint and keeps the file picker.
+**Why** — A small target is easy to miss, and a missed drop makes the browser
+open the file and leave the room.
+
+### D45. CLI output: colour only on terminals; invite links work as room arguments
+*2026-10-19 — #15*
+
+**Decision** — Colour and the redrawn progress bar (with speed and ETA) are used
+only when stdout is a terminal and `NO_COLOR` is unset; piped output stays plain
+text. `join`/`receive` accept an invite link as well as a code, and the link's
+server is used unless `--server` is given (precedence: `--server`, link,
+`$WHOOSH_SERVER`, default). Server close reasons are translated into advice
+("Room x doesn't exist… rooms expire after 10 minutes").
+**Why** — Scripts and logs shouldn't get escape codes. Pasting the link someone
+sent you should just work, without knowing which server it came from.
