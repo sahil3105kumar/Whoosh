@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import getpass
 import logging
 import os
 import re
@@ -32,7 +33,7 @@ from pathlib import Path
 from websockets.exceptions import WebSocketException
 
 from apps.cli import history
-from apps.cli.connection import ConnectError, Mesh, create_room
+from apps.cli.connection import ConnectError, Mesh, create_room, room_needs_password
 from apps.cli.queue import SendQueue
 from apps.cli.room import Room
 from apps.cli.session import Ui, format_bytes
@@ -262,19 +263,24 @@ async def _receive_files(room: Room, ui: Ui) -> bool:
 async def _run(args: argparse.Namespace, server: str, ui: Ui) -> bool:
     is_creator = args.cmd in ("create", "send")
 
+    password = _password(args, confirm=is_creator)
     if is_creator:
-        room_id = create_room(server)
+        room_id = create_room(server, password=password)
         joiner = "join" if args.cmd == "create" else "receive"
         ui.line(f"Room created: {ui.style.bold(room_id)}")
         ui.line(f"On the other machine run:  {ui.style.accent(f'whoosh {joiner} {room_id}')}")
         if server != DEFAULT_SERVER:
             ui.hint(f"(or open {server}/#{room_id} in a browser)")
         ui.hint("Waiting for the other person...")
+        if password:
+            ui.hint("The room needs the password you set; share it separately.")
     else:
         room_id = args.room.code
+        if password is None and room_needs_password(server, room_id):
+            password = _ask_password(f"Password for room {room_id}: ")
         ui.hint(f"Joining room {room_id}...")
 
-    mesh = Mesh(server, room_id)
+    mesh = Mesh(server, room_id, password=password)
     out = Path(getattr(args, "out", ".")).expanduser()
     room = Room(mesh, ui, out, args.name)
     await mesh.start()
@@ -296,6 +302,29 @@ async def _run(args: argparse.Namespace, server: str, ui: Ui) -> bool:
         await room.close()
 
 
+_PROMPT = object()  # --password given without a value: ask
+
+
+def _password(args: argparse.Namespace, *, confirm: bool) -> str | None:
+    """The room password from --password / $WHOOSH_PASSWORD, prompting when
+    --password was given bare (#28)."""
+    if args.password is _PROMPT:
+        first = _ask_password("Room password: ")
+        if confirm and _ask_password("Again: ") != first:
+            raise ConnectError("The passwords didn't match.")
+        return first
+    return args.password or os.environ.get("WHOOSH_PASSWORD") or None
+
+
+def _ask_password(prompt: str) -> str:
+    if not sys.stdin.isatty():
+        raise ConnectError("This room needs a password: pass --password or set WHOOSH_PASSWORD.")
+    password = getpass.getpass(prompt)
+    if not password:
+        raise ConnectError("No password given.")
+    return password
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="whoosh",
@@ -310,6 +339,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     p.add_argument("--name", help="Name shown to the other people in the room")
+    p.add_argument(
+        "--password",
+        nargs="?",
+        const=_PROMPT,
+        metavar="PASSWORD",
+        help="Room password: protects a room you create, or opens a protected one. "
+        "Give it without a value to be asked (or set $WHOOSH_PASSWORD).",
+    )
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
 
     out_help = "Directory for received files (default: current directory)"

@@ -788,3 +788,27 @@ re-sharing chunks with each other, BitTorrent-style) would cut the
 sender's upload, but needs chunk maps, peer selection and partial-file
 serving: a large protocol for rooms of at most 8.
 **Revisit** — If the sender's upload becomes the bottleneck in practice.
+
+---
+
+## v4.0 — Security
+
+### D58. Room passwords: scrypt hash in memory, sent as the first WebSocket message
+*2026-10-19 — #28*
+
+**Decision** — `POST /rooms` takes an optional `{"password": ...}`; the
+server keeps only a salted scrypt hash (16-byte salt, N=2^14) for the
+life of the room. On a protected room, a WebSocket must send
+`{"type": "auth", "password": ...}` as its first message (within 10 s)
+before it gets a slot — on every reconnect too. Wrong passwords are
+limited to 5 per minute per room and client address.
+`GET /rooms/{id}` reports `password_required` so clients can ask first.
+CLI: `--password [VALUE]` (bare: prompted, twice when creating) or
+`$WHOOSH_PASSWORD`; web: an optional password field when creating, a
+prompt when joining a protected room.
+**Why** — Never in the URL: query strings end up in proxy and server
+logs. The password gates *signaling* only — it keeps strangers who learn
+the code out of the room. It isn't an encryption key; confidentiality
+against the server itself comes from D59–D61.
+**Note** — The invite link deliberately doesn't carry the password:
+share it separately.

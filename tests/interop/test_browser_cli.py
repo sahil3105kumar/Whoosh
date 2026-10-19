@@ -565,3 +565,39 @@ async def test_cli_sends_to_two_browsers(server: str, browser: Browser, tmp_path
         assert "to bob" in cli.output() and "to dave" in cli.output()
     finally:
         await cli.close()
+
+
+# ── Security (#28–#32) ──────────────────────────────────────────────
+
+
+async def test_password_protected_room(server: str, browser: Browser, tmp_path: Path):
+    alice = await browser.new_page()
+    await alice.goto(server)
+    await alice.get_by_label("Room password (optional)").fill("open sesame")
+    await alice.get_by_role("button", name="Create room").click()
+    link = await alice.get_by_label("Invite link").input_value(timeout=TIMEOUT_S * 1000)
+    room = link.rsplit("#", 1)[1]
+
+    wrong = await Cli.start(server, "--password", "guess", "join", room)
+    try:
+        assert await wrong.exit_code() == 1
+        assert "Wrong password" in wrong.output()
+    finally:
+        await wrong.close()
+
+    cli = await Cli.start(server, "--password", "open sesame", "join", room, "--out", str(tmp_path))
+    try:
+        await cli.wait_for("Connected peer-to-peer")
+
+        bob = await browser.new_page()
+        await bob.goto(f"{server}/#{room}")
+        await bob.get_by_text(f"Room {room} needs a password").wait_for(timeout=TIMEOUT_S * 1000)
+        await bob.get_by_label("Room password").fill("open sesame")
+        await bob.get_by_role("button", name="Join").click()
+        await wait_connected(bob)
+        await cli.wait_for("joined")
+
+        await cli.type("/quit")
+        assert await cli.exit_code() == 0, cli.output()
+    finally:
+        await cli.close()

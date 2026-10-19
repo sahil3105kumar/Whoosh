@@ -6,7 +6,7 @@ import { Room } from "./components/Room";
 type Screen =
   | { name: "home" }
   // attempt: bumped by "Try again" so the room remounts with a fresh connection
-  | { name: "room"; roomId: string; attempt?: number };
+  | { name: "room"; roomId: string; attempt?: number; password?: string };
 
 /** A shared link looks like https://host/#abcd1234 and opens straight into the room. */
 function roomFromHash(): string | undefined {
@@ -49,7 +49,7 @@ export default function App() {
       <main className="flex-1">
         {screen.name === "home" ? (
           <Home
-            onCreated={(roomId) => setScreen({ name: "room", roomId })}
+            onCreated={(roomId, password) => setScreen({ name: "room", roomId, password })}
             onJoin={(roomId) => setScreen({ name: "room", roomId })}
           />
         ) : (
@@ -57,8 +57,12 @@ export default function App() {
           <Room
             key={`${screen.roomId}:${screen.attempt ?? 0}`}
             roomId={screen.roomId}
+            password={screen.password}
             onLeave={leave}
-            onRetry={() => setScreen({ ...screen, attempt: (screen.attempt ?? 0) + 1 })}
+            // A retry asks for the password again (it may have been wrong)
+            onRetry={() =>
+              setScreen({ ...screen, password: undefined, attempt: (screen.attempt ?? 0) + 1 })
+            }
           />
         )}
       </main>

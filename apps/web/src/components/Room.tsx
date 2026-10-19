@@ -1,5 +1,6 @@
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
+import { roomNeedsPassword } from "../lib/connection";
 import type { QueuedFile } from "../lib/queue";
 import { type LogEntry, type Peer, type PeerTransfer, type Phase, useRoom } from "../useRoom";
 import { Button, Card, formatBytes } from "./ui";
@@ -14,16 +15,109 @@ const phaseText: Record<Phase, string> = {
   error: "Couldn't connect",
 };
 
+/**
+ * A room screen. Protected rooms (#28) first ask for the password, unless
+ * this browser just created the room and already knows it.
+ */
 export function Room({
   roomId,
+  password: knownPassword,
   onLeave,
   onRetry,
 }: {
   roomId: string;
+  password?: string;
   onLeave: () => void;
   onRetry: () => void;
 }) {
-  const room = useRoom(roomId);
+  const [password, setPassword] = useState(knownPassword);
+  const [needsPassword, setNeedsPassword] = useState<boolean>();
+  const [lookupError, setLookupError] = useState<string>();
+
+  useEffect(() => {
+    if (knownPassword) return;
+    let current = true;
+    roomNeedsPassword(roomId)
+      .then((needs) => current && setNeedsPassword(needs))
+      .catch((err: unknown) => current && setLookupError((err as Error).message));
+    return () => {
+      current = false;
+    };
+  }, [roomId, knownPassword]);
+
+  if (lookupError) {
+    return (
+      <Card>
+        <p className="font-medium">Couldn't join</p>
+        <p className="mt-1 text-sm text-red-600 dark:text-red-400" role="alert">
+          {lookupError}
+        </p>
+        <Button variant="secondary" className="mt-4" onClick={onLeave}>
+          Back
+        </Button>
+      </Card>
+    );
+  }
+  if (!knownPassword && needsPassword === undefined) {
+    return <Card>Looking up the room…</Card>;
+  }
+  if (needsPassword && !password) {
+    return <PasswordPrompt roomId={roomId} onSubmit={setPassword} onCancel={onLeave} />;
+  }
+  return <RoomView roomId={roomId} password={password} onLeave={onLeave} onRetry={onRetry} />;
+}
+
+function PasswordPrompt({
+  roomId,
+  onSubmit,
+  onCancel,
+}: {
+  roomId: string;
+  onSubmit: (password: string) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState("");
+  return (
+    <Card>
+      <h2 className="font-medium">Room {roomId} needs a password</h2>
+      <form
+        className="mt-4 flex flex-col gap-2 sm:flex-row"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (value) onSubmit(value);
+        }}
+      >
+        <input
+          type="password"
+          autoFocus
+          className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-slate-700 dark:bg-slate-900"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          aria-label="Room password"
+        />
+        <Button type="submit" disabled={!value}>
+          Join
+        </Button>
+        <Button type="button" variant="secondary" onClick={onCancel}>
+          Cancel
+        </Button>
+      </form>
+    </Card>
+  );
+}
+
+function RoomView({
+  roomId,
+  password,
+  onLeave,
+  onRetry,
+}: {
+  roomId: string;
+  password?: string;
+  onLeave: () => void;
+  onRetry: () => void;
+}) {
+  const room = useRoom(roomId, password);
   const [inviting, setInviting] = useState(false);
   const live = room.phase === "connected";
   const canSend = live && room.peerReady;

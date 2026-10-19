@@ -55,8 +55,8 @@ def server() -> Iterator[str]:
 class Node:
     """One participant: a Mesh plus the live connection to each other peer."""
 
-    def __init__(self, server: str, room: str) -> None:
-        self.mesh = Mesh(server, room)
+    def __init__(self, server: str, room: str, password: str | None = None) -> None:
+        self.mesh = Mesh(server, room, password=password)
         self.peers: dict[str, WebRTCPeer] = {}
         self._changed = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -198,3 +198,20 @@ async def test_forgotten_peers_are_not_reconnected(server: str, room: str, nodes
     b.mesh.forget(a.mesh.peer_id)
     await asyncio.sleep(3)
     assert a.mesh.connected_peers() == [] and b.mesh.connected_peers() == []
+
+
+async def test_password_protected_room(server: str, nodes: list[Node]):
+    room = await asyncio.to_thread(lambda: create_room(server, password="s3cret"))
+    a, b = Node(server, room, "s3cret"), Node(server, room, "s3cret")
+    nodes.extend([a, b])
+    await a.start()
+    await b.start()
+    await asyncio.gather(a.connected_to(1), b.connected_to(1))
+    await _talk(a, b)
+
+    intruder = Mesh(server, room, password="guess")
+    await intruder.start()
+    event = await asyncio.wait_for(intruder.events.get(), 10)
+    assert isinstance(event, Fatal)
+    assert "Wrong password" in str(event.error)
+    await intruder.close()

@@ -200,3 +200,13 @@ def test_room_capacity_is_configurable():
     assert room.state == RoomState.CONNECTED
     with pytest.raises(RoomFullError):
         manager.join_room(room.id, "d")
+
+
+def test_room_password_hash():
+    from packages.signaling.passwords import PasswordHash
+
+    h = PasswordHash.create("correct horse")
+    assert h.matches("correct horse")
+    assert not h.matches("correct horse ")
+    assert b"correct horse" not in h.digest + h.salt
+    assert PasswordHash.create("correct horse").salt != h.salt  # salted per room

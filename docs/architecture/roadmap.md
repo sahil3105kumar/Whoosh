@@ -172,3 +172,9 @@ choices that differ from an issue's wording are recorded in
 | #25 Broadcast messaging | Room-level broadcast helper (CLI `Room.broadcast`, web fan-out) used by chat and ping (D56) | same |
 | #26 Peer management | Membership from signaling + connection state; `hello.name`; peer list, join/leave notices; CLI `/peers` (D56) | `test_group_chat_with_names` |
 | #27 Multi-peer file distribution | One transfer per recipient in parallel; CLI `send --peers N` (D57) | `test_browser_sends_to_everyone`, `test_cli_sends_to_two_browsers` |
+
+## v4.0 — Security
+
+| Issue | Implementation | Verified by |
+|---|---|---|
+| #28 Password-protected rooms | Optional password at creation, scrypt hash, `auth` as first WebSocket message, 5 tries/min (D58); CLI `--password`, web create field and join prompt | `tests/server/test_ws_signaling.py`, `test_password_protected_room` (mesh + interop) |

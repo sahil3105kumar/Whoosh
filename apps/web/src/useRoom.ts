@@ -49,7 +49,7 @@ export function savedName(): string {
 }
 
 /** Everyone in one room, as React state: one Session per peer (#23–#27). */
-export function useRoom(roomId: string) {
+export function useRoom(roomId: string, password?: string) {
   const [meshPhase, setMeshPhase] = useState<ConnectPhase>("signaling");
   const [error, setError] = useState<string>();
   const [log, setLog] = useState<LogEntry[]>([]);
@@ -181,6 +181,7 @@ export function useRoom(roomId: string) {
         }
       },
       setMeshPhase,
+      password,
     );
 
     // Each file goes to everyone connected, in parallel (#27); interrupted
@@ -232,7 +233,7 @@ export function useRoom(roomId: string) {
         mesh.close();
       }, 100);
     };
-  }, [roomId, addLog]);
+  }, [roomId, password, addLog]);
 
   const sendChat = useCallback(
     (text: string) => {

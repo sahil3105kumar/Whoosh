@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 
 from .enums import RoomState
+from .passwords import PasswordHash
 
 
 @dataclass
@@ -27,6 +28,12 @@ class Room:
     created_at: float
     expires_at: float
     peer_ids: set[str] = field(default_factory=set)
+    #: Set when the creator chose a password (#28); only its hash is kept.
+    password: PasswordHash | None = None
+
+    @property
+    def protected(self) -> bool:
+        return self.password is not None
 
     def is_expired(self, *, now: float | None = None) -> bool:
         """Whether this room has passed its expiry time.

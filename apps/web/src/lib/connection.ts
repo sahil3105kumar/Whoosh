@@ -22,11 +22,25 @@ export type ConnectPhase = "signaling" | "waiting" | "connecting";
 
 // ── HTTP ────────────────────────────────────────────────────────────
 
-export async function createRoom(): Promise<string> {
-  const resp = await fetch("/rooms", { method: "POST" });
+export async function createRoom(password?: string): Promise<string> {
+  const resp = await fetch("/rooms", {
+    method: "POST",
+    ...(password
+      ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password }) }
+      : {}),
+  });
   if (resp.status === 429) throw new ConnectError("Too many rooms created. Wait a minute.");
   if (!resp.ok) throw new ConnectError(`Couldn't create a room (HTTP ${resp.status}).`);
   return ((await resp.json()) as { room_id: string }).room_id;
+}
+
+/** Whether joining `roomId` needs a password (#28). Throws ConnectError if
+ * the room doesn't exist. */
+export async function roomNeedsPassword(roomId: string): Promise<boolean> {
+  const resp = await fetch(`/rooms/${encodeURIComponent(roomId)}`);
+  if (resp.status === 404) throw new ConnectError(explainClose("No such room", roomId));
+  if (!resp.ok) throw new ConnectError(`Couldn't look up the room (HTTP ${resp.status}).`);
+  return ((await resp.json()) as { password_required?: boolean }).password_required ?? false;
 }
 
 async function fetchIceServers(): Promise<RTCIceServer[]> {
@@ -133,6 +147,8 @@ export function explainClose(reason: string, roomId: string): string {
   }
   if (reason.startsWith("Room expired")) return `Room ${roomId} has expired. Ask for a new code.`;
   if (reason.startsWith("Room is full")) return `Room ${roomId} is full.`;
+  if (reason.startsWith("Wrong password")) return `Wrong password for room ${roomId}.`;
+  if (reason.startsWith("This room needs a password")) return `Room ${roomId} needs a password.`;
   return reason;
 }
 
@@ -189,6 +205,7 @@ export class Mesh {
     readonly roomId: string,
     private readonly onEvent: (event: MeshEvent) => void,
     private readonly onPhase: (phase: ConnectPhase) => void = () => {},
+    private readonly password?: string,
   ) {}
 
   async start(signal: AbortSignal): Promise<void> {
@@ -238,6 +255,11 @@ export class Mesh {
       `${scheme}://${location.host}/rooms/${encodeURIComponent(this.roomId)}/ws${query}`,
     );
     this.ws = ws;
+    if (this.password) {
+      // Protected room: the first message must authenticate (#28)
+      const password = this.password;
+      ws.addEventListener("open", () => ws.send(JSON.stringify({ type: "auth", password })));
+    }
     ws.addEventListener("message", (event) => {
       let msg: Signal;
       try {

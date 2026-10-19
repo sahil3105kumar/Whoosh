@@ -189,6 +189,9 @@ and deleted on `transfer_cancel` or any integrity failure.
   our slot, plus the peers already connected. Peers that arrive later
   are announced with `peer_joined`; `peer_left` means a slot was released
   (left, or gone longer than the 30 s grace period).
+* In a password-protected room the client's first message must be
+  `{"type": "auth", "password": "..."}`; otherwise the server closes the
+  socket (1008, "This room needs a password" / "Wrong password").
 * `offer` / `answer` / `ice` carry `"to": "<peer_id>"`; the server
   delivers them to that peer only, adding `"from": "<sender>"`. (Without
   `to` they go to everyone, which only makes sense in a 1:1 room.)
