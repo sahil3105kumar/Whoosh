@@ -2,10 +2,13 @@
 Whoosh CLI — chat and send files peer-to-peer.
 
 Usage:
-    whoosh create [--out DIR]           create a room, then chat (/send to send files)
-    whoosh join ROOM_ID [--out DIR]     join a room, then chat
-    whoosh send FILE [FILE ...]         create a room, send files, exit
-    whoosh receive ROOM_ID [--out DIR]  join a room, save incoming files, exit
+    whoosh create [--out DIR]          create a room, then chat (/send to send files)
+    whoosh join ROOM [--out DIR]       join a room, then chat
+    whoosh send FILE [FILE ...]        create a room, send files, exit
+    whoosh receive ROOM [--out DIR]    join a room, save incoming files, exit
+
+    ROOM is a room code (a1b2c3d4) or an invite link (https://host/#a1b2c3d4);
+    a link also selects its server.
 
     Global: --server URL (default $WHOOSH_SERVER, else http://localhost:8000),
             -v for debug logs.
@@ -18,29 +21,61 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import shlex
 import sys
 import threading
+import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
 
 from websockets.exceptions import WebSocketException
 
 from apps.cli.connection import ConnectError, Connection, connect, create_room
-from apps.cli.session import Session, Ui
+from apps.cli.queue import SendQueue
+from apps.cli.session import Session, Ui, format_bytes
 from packages.protocol.enums import Capability
 from packages.transfer.manager import TransferStatus
 
 log = logging.getLogger(__name__)
 
+DEFAULT_SERVER = "http://localhost:8000"
+
 HELP = """\
 Type a message and press Enter to chat. Commands:
-  /send PATH [PATH ...]   send files (quote paths with spaces)
-  /cancel                 cancel all active transfers
+  /send PATH [PATH ...]   queue files to send, one at a time (quote paths with spaces)
+  /queue                  show the file being sent and those waiting
+  /cancel                 cancel the current transfer and clear the queue
   /ping                   measure round-trip time
   /quit                   leave"""
 
 #: How long to wait for the peer's hello before sending files.
 _HELLO_TIMEOUT = 10.0
+
+_ROOM_CODE = re.compile(r"^[0-9a-f]{8}$")
+
+
+# ── Arguments ───────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RoomRef:
+    code: str
+    #: Server taken from an invite link, if one was given.
+    server: str | None = None
+
+
+def room_ref(value: str) -> RoomRef:
+    """argparse type: a room code, or an invite link carrying one."""
+    value = value.strip()
+    if _ROOM_CODE.match(value.lower()):
+        return RoomRef(value.lower())
+    url = urllib.parse.urlsplit(value)
+    if url.scheme in ("http", "https") and url.netloc and _ROOM_CODE.match(url.fragment.lower()):
+        return RoomRef(url.fragment.lower(), f"{url.scheme}://{url.netloc}")
+    raise argparse.ArgumentTypeError(
+        f"{value!r} isn't a room code (8 characters like a1b2c3d4) or an invite link"
+    )
 
 
 # ── stdin ───────────────────────────────────────────────────────────
@@ -65,9 +100,11 @@ def _stdin_lines() -> asyncio.Queue[str | None]:
 
 
 async def _interactive(conn: Connection, session: Session, ui: Ui) -> None:
-    ui.line("✓ Connected peer-to-peer. Type /help for commands.")
+    ui.ok("Connected peer-to-peer.")
+    ui.hint("Type a message and press Enter, /send PATH to send files, /help for more.")
+    queue = SendQueue(lambda path: _send_one(session, path, ui))
     inbound = asyncio.create_task(session.run_inbound())
-    commands = asyncio.create_task(_command_loop(session, ui))
+    commands = asyncio.create_task(_command_loop(session, queue, ui))
     tasks: set[asyncio.Task[None]] = {inbound, commands, conn.signaling}
 
     try:
@@ -76,22 +113,25 @@ async def _interactive(conn: Connection, session: Session, ui: Ui) -> None:
             for task in done:
                 task.result()  # re-raise failures
             if inbound in done:
-                ui.line("Peer disconnected.")
+                ui.line("The other person left.")
                 return
             if commands in done:
                 return
             # Only signaling finished: the server went away, P2P is unaffected
             tasks.discard(conn.signaling)
     finally:
+        dropped = queue.clear()
+        if dropped:
+            ui.hint(f"{len(dropped)} queued file(s) weren't sent.")
         for transfer in session.transfers.transfers:
-            session.transfers.cancel(transfer.id, "peer left")
+            session.transfers.cancel(transfer.id, "session ended")
+        await queue.close()
         for task in (inbound, commands):
             task.cancel()
 
 
-async def _command_loop(session: Session, ui: Ui) -> None:
+async def _command_loop(session: Session, queue: SendQueue, ui: Ui) -> None:
     lines = _stdin_lines()
-    sends: set[asyncio.Task[None]] = set()
 
     while (line := await lines.get()) is not None:
         line = line.strip()
@@ -108,37 +148,57 @@ async def _command_loop(session: Session, ui: Ui) -> None:
             ui.line(HELP)
         elif cmd == "/ping":
             session.ping()
+        elif cmd == "/queue":
+            _show_queue(queue, ui)
         elif cmd == "/cancel":
+            dropped = queue.clear()
             cancelled = [t for t in session.transfers.transfers if session.transfers.cancel(t.id)]
-            if not cancelled:
-                ui.line("No active transfers.")
+            if not cancelled and not dropped:
+                ui.hint("Nothing to cancel.")
+            elif dropped:
+                ui.hint(f"Removed {len(dropped)} queued file(s).")
         elif cmd == "/send":
             if not session.peer_can(Capability.FILE_TRANSFER):
-                ui.line("Peer doesn't support file transfer.")
+                ui.error("The other side doesn't support file transfer.")
                 continue
-            for path in _parse_paths(arg, ui):
-                task = asyncio.create_task(_send_one(session, path, ui))
-                sends.add(task)
-                task.add_done_callback(sends.discard)
+            paths = _parse_paths(arg, ui)
+            if paths:
+                busy = queue.current is not None
+                queue.add(paths)
+                if busy or len(paths) > 1:
+                    ui.hint(f"Queued {len(paths)} file(s); /queue to see the list.")
         else:
-            ui.line(f"Unknown command {cmd}. Type /help.")
+            ui.error(f"Unknown command {cmd}. Type /help for the list.")
+
+
+def _show_queue(queue: SendQueue, ui: Ui) -> None:
+    if queue.current is None and not queue.waiting:
+        ui.hint("Queue is empty.")
+        return
+    if queue.current is not None:
+        ui.line(f"  sending  {queue.current.name}")
+    for i, path in enumerate(queue.waiting, 1):
+        size = format_bytes(path.stat().st_size) if path.exists() else "missing"
+        ui.line(f"  #{i:<6} {path.name} {ui.style.dim(f'({size})')}")
 
 
 def _parse_paths(arg: str, ui: Ui) -> list[Path]:
     try:
         raw = shlex.split(arg)
     except ValueError as exc:
-        ui.line(f"Can't parse paths: {exc}")
+        ui.error(f"Can't parse paths: {exc}")
         return []
     if not raw:
-        ui.line("Usage: /send PATH [PATH ...]")
+        ui.hint("Usage: /send PATH [PATH ...]")
     paths = []
     for item in raw:
         path = Path(item).expanduser()
         if path.is_file():
             paths.append(path)
+        elif path.is_dir():
+            ui.error(f"{path} is a folder; send the files inside it, or zip it first.")
         else:
-            ui.line(f"Not a file: {path}")
+            ui.error(f"No such file: {path}")
     return paths
 
 
@@ -146,7 +206,7 @@ async def _send_one(session: Session, path: Path, ui: Ui) -> None:
     try:
         await session.transfers.send_file(path)
     except OSError as exc:
-        ui.line(f"✗ {path}: {exc}")
+        ui.error(f"{path}: {exc}")
 
 
 async def _send_files(session: Session, paths: list[Path], ui: Ui) -> bool:
@@ -155,14 +215,16 @@ async def _send_files(session: Session, paths: list[Path], ui: Ui) -> bool:
         try:
             await asyncio.wait_for(asyncio.shield(session.peer_hello), _HELLO_TIMEOUT)
         except TimeoutError:
-            ui.line("Peer never said hello.")
+            ui.error("The other side connected but never responded.")
             return False
         if not session.peer_can(Capability.FILE_TRANSFER):
-            ui.line("Peer doesn't support file transfer.")
+            ui.error("The other side doesn't support file transfer.")
             return False
 
         ok = True
-        for path in paths:
+        for i, path in enumerate(paths, 1):
+            if len(paths) > 1:
+                ui.hint(f"File {i} of {len(paths)}")
             transfer = await session.transfers.send_file(path)
             ok &= transfer.status is TransferStatus.COMPLETED
             if inbound.done():
@@ -175,32 +237,33 @@ async def _send_files(session: Session, paths: list[Path], ui: Ui) -> bool:
 
 
 async def _receive_files(session: Session, ui: Ui) -> bool:
-    ui.line("✓ Connected peer-to-peer. Waiting for files...")
+    ui.ok("Connected peer-to-peer. Waiting for files...")
     await session.run_inbound()  # until the sender closes the connection
     transfers = session.transfers.transfers
     if not transfers:
-        ui.line("Sender disconnected without sending anything.")
+        ui.error("The sender disconnected without sending anything.")
     return bool(transfers) and all(t.status is TransferStatus.COMPLETED for t in transfers)
 
 
 # ── Entrypoint ──────────────────────────────────────────────────────
 
 
-async def _run(args: argparse.Namespace) -> bool:
-    ui = Ui()
+async def _run(args: argparse.Namespace, server: str, ui: Ui) -> bool:
     is_creator = args.cmd in ("create", "send")
 
     if is_creator:
-        room_id = create_room(args.server)
-        ui.line(f"Room created: {room_id}")
+        room_id = create_room(server)
         joiner = "join" if args.cmd == "create" else "receive"
-        ui.line(f"On the other machine run:  whoosh {joiner} {room_id}")
-        ui.line("Waiting for peer...")
+        ui.line(f"Room created: {ui.style.bold(room_id)}")
+        ui.line(f"On the other machine run:  {ui.style.accent(f'whoosh {joiner} {room_id}')}")
+        if server != DEFAULT_SERVER:
+            ui.hint(f"(or open {server}/#{room_id} in a browser)")
+        ui.hint("Waiting for the other person...")
     else:
-        room_id = args.room_id
-        ui.line(f"Joining room {room_id}...")
+        room_id = args.room.code
+        ui.hint(f"Joining room {room_id}...")
 
-    async with connect(args.server, room_id, is_creator=is_creator) as conn:
+    async with connect(server, room_id, is_creator=is_creator) as conn:
         out = Path(getattr(args, "out", ".")).expanduser()
         session = Session(conn.peer, out, ui)
         session.start()
@@ -213,29 +276,42 @@ async def _run(args: argparse.Namespace) -> bool:
         return await _receive_files(session, ui)
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(prog="whoosh", description="Peer-to-peer chat and file transfer")
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="whoosh",
+        description="Peer-to-peer chat and file transfer.",
+        epilog="Examples:\n  whoosh send report.pdf\n  whoosh receive a1b2c3d4\n"
+        "  whoosh receive https://whoosh.example/#a1b2c3d4",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument(
         "--server",
-        default=os.environ.get("WHOOSH_SERVER", "http://localhost:8000"),
-        help="Signaling server URL (default: $WHOOSH_SERVER or http://localhost:8000)",
+        help=f"Signaling server URL (default: $WHOOSH_SERVER or {DEFAULT_SERVER})",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
 
     out_help = "Directory for received files (default: current directory)"
+    room_help = "Room code or invite link"
     c = sub.add_parser("create", help="Create a room and chat")
     c.add_argument("--out", default=".", help=out_help)
     j = sub.add_parser("join", help="Join a room and chat")
-    j.add_argument("room_id")
+    j.add_argument("room", type=room_ref, help=room_help)
     j.add_argument("--out", default=".", help=out_help)
     s = sub.add_parser("send", help="Create a room, send files, exit")
     s.add_argument("files", nargs="+", type=Path)
     r = sub.add_parser("receive", help="Join a room, save incoming files, exit")
-    r.add_argument("room_id")
+    r.add_argument("room", type=room_ref, help=room_help)
     r.add_argument("--out", default=".", help=out_help)
+    return p
 
+
+def main() -> None:
+    p = _parser()
     args = p.parse_args()
+    if args.cmd is None:
+        p.print_help()
+        sys.exit(2)
 
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
@@ -251,17 +327,28 @@ def main() -> None:
         if missing:
             p.error(f"not a file: {', '.join(map(str, missing))}")
 
+    # Precedence: --server, then a server from an invite link, then the environment
+    room = getattr(args, "room", None)
+    server = (
+        args.server
+        or (room.server if room else None)
+        or os.environ.get("WHOOSH_SERVER")
+        or DEFAULT_SERVER
+    ).rstrip("/")
+
+    ui = Ui()
     try:
-        ok = asyncio.run(_run(args))
+        ok = asyncio.run(_run(args, server, ui))
     except ConnectError as exc:
-        print(f"✗ {exc}", file=sys.stderr)
+        ui.error(str(exc))
         sys.exit(1)
     # Network failures talking to the signaling server: unreachable, TLS,
     # HTTP errors (URLError is an OSError), rejected WebSocket handshake
     except (OSError, WebSocketException) as exc:
-        print(f"✗ Can't reach signaling server {args.server}: {exc}", file=sys.stderr)
+        ui.error(f"Can't reach the signaling server at {server}: {exc}")
         sys.exit(1)
     except KeyboardInterrupt:
+        ui.hint("\nInterrupted.")
         sys.exit(130)
     sys.exit(0 if ok else 1)
 

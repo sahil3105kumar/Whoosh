@@ -22,6 +22,8 @@ export interface SessionEvents {
   onNotice(text: string): void;
   onTransfer(transfer: Transfer): void;
   onPeerReady(capabilities: Capability[]): void;
+  /** Round-trip time from a ping this side sent. */
+  onLatency(ms: number): void;
   onClosed(): void;
 }
 
@@ -104,9 +106,7 @@ export class Session {
         this.send("pong", { timestamp: msg.payload.timestamp });
         break;
       case "pong":
-        this.events.onNotice(
-          `Round trip: ${(performance.now() - msg.payload.timestamp).toFixed(1)} ms`,
-        );
+        this.events.onLatency(performance.now() - msg.payload.timestamp);
         break;
       case "error":
         // Never answer an error with an error — that's how loops start

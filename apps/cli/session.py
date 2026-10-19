@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -42,13 +45,57 @@ def format_bytes(n: float) -> str:
     raise AssertionError("unreachable")
 
 
+def format_duration(seconds: float) -> str:
+    if seconds < 1:
+        return "<1s"
+    if seconds < 60:
+        return f"{math.ceil(seconds)}s"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m {math.ceil(seconds % 60)}s"
+    return f"{minutes // 60}h {minutes % 60}m"
+
+
+class Style:
+    """ANSI styling, or plain text when output isn't a colour terminal
+    (piped, or NO_COLOR set: https://no-color.org)."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def _wrap(self, code: str, text: str) -> str:
+        return f"\x1b[{code}m{text}\x1b[0m" if self.enabled else text
+
+    def ok(self, text: str) -> str:
+        return self._wrap("32", text)
+
+    def error(self, text: str) -> str:
+        return self._wrap("31", text)
+
+    def accent(self, text: str) -> str:
+        return self._wrap("36", text)
+
+    def dim(self, text: str) -> str:
+        return self._wrap("2", text)
+
+    def bold(self, text: str) -> str:
+        return self._wrap("1", text)
+
+
+def progress_bar(fraction: float, width: int) -> str:
+    """``████████░░░░`` filled to ``fraction`` (0..1)."""
+    filled = round(max(0.0, min(1.0, fraction)) * width)
+    return "█" * filled + "░" * (width - filled)
+
+
 class Ui:
-    """Terminal output. On a TTY, progress is a single line redrawn in
-    place; otherwise only start and finish are printed."""
+    """Terminal output. On a TTY, progress is a single redrawn line with a
+    bar, speed and ETA; otherwise only start and finish are printed."""
 
     def __init__(self, stream: TextIO = sys.stdout) -> None:
         self._stream = stream
         self._tty = stream.isatty()
+        self.style = Style(self._tty and not os.environ.get("NO_COLOR"))
         self._progress_shown = False
         self._started: dict[str, float] = {}
 
@@ -56,24 +103,27 @@ class Ui:
         self._clear_progress()
         print(text, file=self._stream, flush=True)
 
+    def ok(self, text: str) -> None:
+        self.line(self.style.ok(f"✓ {text}"))
+
+    def error(self, text: str) -> None:
+        self.line(self.style.error(f"✗ {text}"))
+
+    def hint(self, text: str) -> None:
+        self.line(self.style.dim(text))
+
     def transfer_update(self, t: Transfer) -> None:
-        arrow = "↑" if t.direction is Direction.SEND else "↓"
+        arrow = self.style.accent("↑" if t.direction is Direction.SEND else "↓")
         started = self._started.setdefault(t.id, time.monotonic())
         elapsed = max(time.monotonic() - started, 1e-6)
+        speed = t.bytes_done / elapsed
 
         if t.status is TransferStatus.STREAMING:
             if not self._tty:
                 if t.bytes_done == 0:
                     self.line(f"{arrow} {t.filename} ({format_bytes(t.size)})...")
                 return
-            pct = 100 * t.bytes_done / t.size if t.size else 100.0
-            self._stream.write(
-                f"\r\x1b[K{arrow} {t.filename}  {pct:5.1f}%  "
-                f"{format_bytes(t.bytes_done)} / {format_bytes(t.size)}  "
-                f"{format_bytes(t.bytes_done / elapsed)}/s"
-            )
-            self._stream.flush()
-            self._progress_shown = True
+            self._draw_progress(arrow, t, speed)
             return
 
         self._started.pop(t.id, None)
@@ -82,9 +132,26 @@ class Ui:
             details = format_bytes(t.size)
             if t.size >= 1024 * 1024:  # below this, setup time dominates the "speed"
                 details += f", {format_bytes(t.size / elapsed)}/s"
-            self.line(f"{arrow} {t.filename}: {where} ({details})")
+            self.line(f"{arrow} {t.filename}: {self.style.ok(where)} {self.style.dim(details)}")
         else:
-            self.line(f"✗ {t.filename}: {t.status} ({t.reason})")
+            self.error(f"{t.filename}: {t.status} ({t.reason})")
+
+    def _draw_progress(self, arrow: str, t: Transfer, speed: float) -> None:
+        fraction = t.bytes_done / t.size if t.size else 1.0
+        eta = format_duration((t.size - t.bytes_done) / speed) if speed > 0 else "?"
+        stats = (
+            f" {100 * fraction:3.0f}%  {format_bytes(t.bytes_done)}/{format_bytes(t.size)}"
+            f"  {format_bytes(speed)}/s  ETA {eta}"
+        )
+        columns = shutil.get_terminal_size().columns
+        # arrow + space + name + space + bar + stats, fitted to the terminal
+        name_width = max(8, min(len(t.filename), columns // 4))
+        name = t.filename if len(t.filename) <= name_width else t.filename[: name_width - 1] + "…"
+        bar_width = max(10, columns - len(stats) - name_width - 5)
+        bar = self.style.accent(progress_bar(fraction, bar_width))
+        self._stream.write(f"\r\x1b[K{arrow} {name:<{name_width}} {bar}{self.style.dim(stats)}")
+        self._stream.flush()
+        self._progress_shown = True
 
     def _clear_progress(self) -> None:
         if self._progress_shown:
@@ -133,15 +200,15 @@ class Session:
             if not self.peer_hello.done():
                 self.peer_hello.set_result(set(payload.capabilities))
         elif isinstance(payload, ChatPayload):
-            self._ui.line(f"peer: {payload.text}")
+            self._ui.line(f"{self._ui.style.bold('peer:')} {payload.text}")
         elif isinstance(payload, PingPayload):
             self._send(MessageType.PONG, PongPayload(timestamp=payload.timestamp))
         elif isinstance(payload, PongPayload):
             rtt_ms = (time.monotonic() - payload.timestamp) * 1000
-            self._ui.line(f"pong: {rtt_ms:.1f} ms round trip")
+            self._ui.hint(f"pong: {rtt_ms:.1f} ms round trip")
         elif isinstance(payload, ErrorPayload):
             # Never answer an error with an error — that's how loops start
-            self._ui.line(f"peer reported an error: {payload.code}: {payload.message}")
+            self._ui.error(f"peer reported an error: {payload.code}: {payload.message}")
         else:
             log.debug("ignoring %s message", msg.type)
 

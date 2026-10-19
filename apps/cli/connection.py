@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -42,10 +43,31 @@ class Connection:
 # ── HTTP helpers (stdlib only, no requests/httpx needed) ─────────────
 
 
+def explain_close(reason: str, room_id: str) -> str:
+    """Turn the server's WebSocket close reason into advice for a person."""
+    if reason.startswith("No such room"):
+        return (
+            f"Room {room_id} doesn't exist. Check the code; rooms also expire "
+            "10 minutes after they're created."
+        )
+    if reason.startswith("Room expired"):
+        return f"Room {room_id} has expired. Ask for a new code."
+    if reason.startswith("Room is full"):
+        return f"Room {room_id} already has two people in it."
+    return reason
+
+
 def create_room(server: str) -> str:
     req = urllib.request.Request(f"{server}/rooms", method="POST")
-    with urllib.request.urlopen(req) as resp:
-        room_id: str = json.loads(resp.read())["room_id"]
+    try:
+        with urllib.request.urlopen(req) as resp:
+            room_id: str = json.loads(resp.read())["room_id"]
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise ConnectError(
+                "Too many rooms created from your address. Wait a minute and try again."
+            ) from exc
+        raise
     return room_id
 
 
@@ -113,7 +135,9 @@ async def connect(server: str, room_id: str, *, is_creator: bool) -> AsyncIterat
         listen_task = asyncio.create_task(_listen_signaling())
 
         def _closed_message(what: str) -> str:
-            return f"Signaling closed {what}" + (f": {close_reason}" if close_reason else ".")
+            if close_reason:
+                return explain_close(close_reason, room_id)
+            return f"The signaling server closed the connection {what}."
 
         try:
             if not await _wait_or_fail(negotiation_started, listen_task):

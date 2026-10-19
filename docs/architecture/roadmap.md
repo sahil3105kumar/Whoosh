@@ -142,3 +142,12 @@ choices that differ from an issue's wording are recorded in
 | #10 Progress reporting | Progress callbacks on both sides; CLI progress line, web progress bars (D18) | `test_progress_updates_reach_completion` |
 | #11 Web client | `apps/web` (React, TypeScript, Vite, Tailwind) | vitest, interop suite |
 | #12 Python CLI | `apps/cli`: `create`/`join`/`send`/`receive`. Built on argparse rather than Typer (D27) | interop suite, `tests/` |
+
+## v1.1 — Usability
+
+| Issue | Implementation | Verified by |
+|---|---|---|
+| #13 Drag-and-drop uploads | Whole page is a drop target with an overlay (D44) | interop suite (drops dispatched to the page) |
+| #14 Improved transfer queue | `SendQueue` in both clients: ordered, one at a time, removable (D43); CLI `/queue` | `queue.test.ts`, `tests/cli/test_cli.py` |
+| #15 Better CLI experience | Progress bar with speed/ETA, colour (TTY only, `NO_COLOR`), friendly errors, room codes or invite links as arguments, help when run bare (D45) | `tests/cli/test_cli.py` |
+| #16 UI improvements | Latency in the status bar, unread count in the tab title, ETA per transfer, confirm before leaving mid-transfer, **Try again** after a failed connection, invite links accepted in the join box, empty state | interop suite, screenshots |
