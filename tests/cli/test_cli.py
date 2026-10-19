@@ -46,7 +46,7 @@ def test_room_ref_rejects_everything_else(value: str):
     [
         ("No such room: 'a1b2c3d4'", "doesn't exist"),
         ("Room expired: 'a1b2c3d4'", "has expired"),
-        ("Room is full: 'a1b2c3d4'", "already has two people"),
+        ("Room is full: 'a1b2c3d4'", "is full"),
         ("origin not allowed", "origin not allowed"),
     ],
 )

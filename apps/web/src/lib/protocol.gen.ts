@@ -9,6 +9,7 @@ export type Capability = "chat" | "file_transfer" | "cancel" | "resume" | "ack";
 /** Capability negotiation sent immediately after the DataChannel opens. */
 export interface HelloPayload {
   capabilities: Capability[];
+  name?: string | null;
 }
 
 /** A text chat message. */
@@ -94,6 +95,7 @@ export interface FieldSpec {
 export const PAYLOAD_FIELDS: Record<MessageType, Record<string, FieldSpec>> = {
   hello: {
     capabilities: { kind: "string[]", optional: false, nullable: false },
+    name: { kind: "string", optional: true, nullable: true },
   },
   chat: {
     text: { kind: "string", optional: false, nullable: false },

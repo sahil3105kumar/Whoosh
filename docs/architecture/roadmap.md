@@ -162,3 +162,13 @@ choices that differ from an issue's wording are recorded in
 | #20 Integrity verification | End-to-end SHA-256 in `transfer_complete`, verified before the file is saved; covers resumed files (D17, D53) | `test_corrupted_chunk_fails_checksum_on_both_sides`, `test_corrupted_partial_fails_then_restarts_clean`, web equivalents |
 | #21 Adaptive chunk sizing | `ChunkSizer` in both senders: 16 KiB → up to 256 KiB while throughput improves, capped by the connection's max message size (D52; no measurable gain on localhost) | `tests/transfer/test_chunking.py`, `chunking.test.ts`, interop suite |
 | #22 Transfer history | CLI: JSON Lines in `$XDG_STATE_HOME/whoosh/`, `whoosh history`; web: localStorage, "Recent transfers" panel (D54) | `tests/cli/test_history.py`, `history.test.ts`, interop (browser ↔ browser) |
+
+## v3.0 — Multi-Peer Rooms
+
+| Issue | Implementation | Verified by |
+|---|---|---|
+| #23 Multiple participants | Full mesh up to 8 peers, addressed signaling, smaller peer_id offers (D55); `Mesh` + per-peer sessions in both clients | `tests/cli/test_mesh.py` (3-peer mesh, drops), interop 3-party tests |
+| #24 Group chat | Chat sent on every pair's channel, shown with the sender's name (D56) | `test_group_chat_with_names` |
+| #25 Broadcast messaging | Room-level broadcast helper (CLI `Room.broadcast`, web fan-out) used by chat and ping (D56) | same |
+| #26 Peer management | Membership from signaling + connection state; `hello.name`; peer list, join/leave notices; CLI `/peers` (D56) | `test_group_chat_with_names` |
+| #27 Multi-peer file distribution | One transfer per recipient in parallel; CLI `send --peers N` (D57) | `test_browser_sends_to_everyone`, `test_cli_sends_to_two_browsers` |

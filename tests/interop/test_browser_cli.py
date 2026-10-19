@@ -295,7 +295,7 @@ async def test_chat_and_ping_both_ways(server: str, browser: Browser, tmp_path: 
 
         await page.get_by_label("Message").fill("hello from the browser")
         await page.get_by_label("Message").press("Enter")
-        await cli.wait_for("peer: hello from the browser")
+        await cli.wait_for(r": hello from the browser")
 
         await cli.type("/ping")
         await cli.wait_for(r"pong: [\d.]+ ms")
@@ -304,7 +304,7 @@ async def test_chat_and_ping_both_ways(server: str, browser: Browser, tmp_path: 
 
         await cli.type("/quit")
         assert await cli.exit_code() == 0, cli.output()
-        await page.get_by_text("The other person left").wait_for(timeout=TIMEOUT_S * 1000)
+        await page.get_by_text("Everyone else left").wait_for(timeout=TIMEOUT_S * 1000)
     finally:
         await cli.close()
 
@@ -382,7 +382,7 @@ async def test_cli_to_browser_resumes_after_cli_is_killed(
         cli.proc.kill()  # the sender vanishes mid-transfer
         # No bye arrived, so the browser assumes a network problem and tries
         # to get the connection back (#19)
-        await page.get_by_text("reconnecting").wait_for(timeout=TIMEOUT_S * 1000)
+        await page.get_by_text("Connection lost — reconnecting").wait_for(timeout=TIMEOUT_S * 1000)
     finally:
         await cli.close()
 
@@ -464,5 +464,104 @@ async def test_browser_send_survives_a_dropped_connection(
         assert "Reconnected" in cli.output()
         assert "resuming from" in cli.output()
         assert (tmp_path / "big.bin").read_bytes() == pattern_bytes(size, seed=5)
+    finally:
+        await cli.close()
+
+
+# ── Multi-peer rooms (#23–#27) ──────────────────────────────────────
+
+
+async def named_page(browser: Browser, name: str) -> Page:
+    """A page whose user has set their display name."""
+    page = await browser.new_page()
+    await page.add_init_script(f"localStorage.setItem('whoosh.name', {name!r})")
+    return page
+
+
+async def test_group_chat_with_names(server: str, browser: Browser, tmp_path: Path):
+    alice = await named_page(browser, "alice")
+    room = await create_room(alice, server)
+    bob = await named_page(browser, "bob")
+    await bob.goto(f"{server}/#{room}")
+    cli = await Cli.start(server, "--name", "carol", "join", room, "--out", str(tmp_path))
+    try:
+        await cli.wait_for("Connected peer-to-peer")
+        await cli.wait_for("alice joined")
+        await cli.wait_for("bob joined")
+        # Everyone sees everyone (#23, #26)
+        for page in (alice, bob):
+            peers = page.get_by_label("People in the room")
+            await peers.get_by_text("carol").wait_for(timeout=TIMEOUT_S * 1000)
+        assert await alice.get_by_label("People in the room").get_by_text("bob").count() == 1
+
+        # One message reaches the whole room, labelled with its sender (#24)
+        await cli.type("hello everyone")
+        for page in (alice, bob):
+            await page.get_by_text("hello everyone").wait_for(timeout=TIMEOUT_S * 1000)
+            assert await page.get_by_text("carol", exact=True).count() >= 1
+        await alice.get_by_label("Message").fill("hi from alice")
+        await alice.get_by_label("Message").press("Enter")
+        await cli.wait_for("alice: hi from alice")
+        await bob.get_by_text("hi from alice").wait_for(timeout=TIMEOUT_S * 1000)
+
+        # Leaving is announced to the others
+        await bob.get_by_role("button", name="Leave").click()
+        await cli.wait_for("bob left")
+        await alice.get_by_text("bob left.").wait_for(timeout=TIMEOUT_S * 1000)
+
+        await cli.type("/quit")
+        assert await cli.exit_code() == 0, cli.output()
+    finally:
+        await cli.close()
+
+
+async def test_browser_sends_to_everyone(server: str, browser: Browser, tmp_path: Path):
+    alice = await named_page(browser, "alice")
+    room = await create_room(alice, server)
+    bob = await named_page(browser, "bob")
+    await bob.goto(f"{server}/#{room}")
+    cli = await Cli.start(server, "join", room, "--out", str(tmp_path))
+    try:
+        await cli.wait_for("alice joined")
+        await (
+            alice.get_by_label("People in the room")
+            .get_by_text("bob")
+            .wait_for(timeout=TIMEOUT_S * 1000)
+        )
+        await (
+            alice.get_by_label("People in the room")
+            .get_by_text("peer-")
+            .wait_for(timeout=TIMEOUT_S * 1000)
+        )
+
+        size = 3_000_000
+        await drop_file(alice, "for-all.bin", size, seed=9)  # one drop, two recipients (#27)
+
+        expected = hashlib.sha256(pattern_bytes(size, seed=9)).hexdigest()
+        assert await received_sha256(bob, "for-all.bin") == expected
+        await cli.wait_for(r"for-all\.bin: saved to")
+        assert (tmp_path / "for-all.bin").read_bytes() == pattern_bytes(size, seed=9)
+        assert await alice.get_by_text("Delivered").count() == 2  # one row per recipient
+
+        await cli.type("/quit")
+        assert await cli.exit_code() == 0, cli.output()
+    finally:
+        await cli.close()
+
+
+async def test_cli_sends_to_two_browsers(server: str, browser: Browser, tmp_path: Path):
+    src = tmp_path / "shared.bin"
+    src.write_bytes(os.urandom(2_000_000))
+    cli = await Cli.start(server, "send", "--peers", "2", str(src))
+    try:
+        room = (await cli.wait_for(r"Room created: ([0-9a-f]{8})"))[1]
+        pages = [await named_page(browser, n) for n in ("bob", "dave")]
+        for page in pages:
+            await page.goto(f"{server}/#{room}")
+        expected = hashlib.sha256(src.read_bytes()).hexdigest()
+        for page in pages:
+            assert await received_sha256(page, src.name) == expected
+        assert await cli.exit_code() == 0, cli.output()
+        assert "to bob" in cli.output() and "to dave" in cli.output()
     finally:
         await cli.close()

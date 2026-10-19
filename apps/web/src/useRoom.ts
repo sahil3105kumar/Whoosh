@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { type ConnectPhase, Link, type PeerChannel } from "./lib/connection";
+import { type ConnectPhase, Mesh } from "./lib/connection";
 import { recordTransfer } from "./lib/history";
 import { type QueuedFile, SendQueue } from "./lib/queue";
 import { Session } from "./lib/session";
@@ -11,156 +11,269 @@ export type Phase = ConnectPhase | "connected" | "reconnecting" | "closed" | "er
 export interface LogEntry {
   id: number;
   from: "me" | "peer" | "system";
+  /** Who sent it, for messages from peers. */
+  name?: string;
   text: string;
+}
+
+export interface Peer {
+  id: string;
+  name: string;
+  connected: boolean;
+}
+
+/** A transfer, and who it's with. */
+export interface PeerTransfer extends Transfer {
+  key: string;
+  peerName: string;
 }
 
 /** How often to measure latency while connected (shown in the status bar). */
 const LATENCY_INTERVAL_MS = 10_000;
-/** Attempts per file when the connection keeps dropping (#19). */
+/** How long a peer whose connection dropped (no bye) gets to come back. */
+const RECONNECT_TIMEOUT_MS = 60_000;
+/** Attempts per file per peer when the connection keeps dropping (#19). */
 const MAX_SEND_ATTEMPTS = 3;
 /** How long a retry waits for the reconnect. */
 const RETRY_WAIT_MS = 90_000;
 
 let nextLogId = 0;
 
-/** Connection + session lifecycle for one room, as React state. */
-export function useRoom(roomId: string, isCreator: boolean) {
-  const [phase, setPhase] = useState<Phase>("signaling");
+/** Our display name, chosen on the home page (#26). */
+export function savedName(): string {
+  try {
+    return localStorage.getItem("whoosh.name") ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** Everyone in one room, as React state: one Session per peer (#23–#27). */
+export function useRoom(roomId: string) {
+  const [meshPhase, setMeshPhase] = useState<ConnectPhase>("signaling");
   const [error, setError] = useState<string>();
   const [log, setLog] = useState<LogEntry[]>([]);
-  const [transfers, setTransfers] = useState<Transfer[]>([]);
+  const [transfers, setTransfers] = useState<PeerTransfer[]>([]);
   const [queued, setQueued] = useState<readonly QueuedFile[]>([]);
-  const [peerReady, setPeerReady] = useState(false);
+  const [peers, setPeers] = useState<Peer[]>([]);
+  const [everConnected, setEverConnected] = useState(false);
   const [latencyMs, setLatencyMs] = useState<number>();
-  const sessionRef = useRef<Session>(undefined);
+  const sessionsRef = useRef(new Map<string, Session>());
   const queueRef = useRef<SendQueue>(undefined);
   // A Ping button press reports its result in the chat; background pings don't
   const manualPing = useRef(false);
 
-  const addLog = useCallback((from: LogEntry["from"], text: string) => {
-    setLog((entries) => [...entries, { id: nextLogId++, from, text }]);
+  const addLog = useCallback((from: LogEntry["from"], text: string, name?: string) => {
+    setLog((entries) => [...entries, { id: nextLogId++, from, text, name }]);
   }, []);
 
   useEffect(() => {
     const abort = new AbortController();
-    const link = new Link(roomId, isCreator, setPhase);
-    let pinger: ReturnType<typeof setInterval> | undefined;
+    const sessions = sessionsRef.current;
+    const lostTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    const latencies = new Map<string, number>();
+    const name = savedName();
     let alive = true;
 
-    const session = new Session(
-      {
-        onChat: (text) => addLog("peer", text),
-        onNotice: (text) => addLog("system", text),
-        onTransfer: (t) => {
-          if (t.status !== "streaming") recordTransfer(t); // reported once, when it ends
-          setTransfers((list) => {
-            const i = list.findIndex((x) => x.id === t.id);
-            return i === -1 ? [...list, t] : list.with(i, t);
-          });
-        },
-        onPeerReady: () => setPeerReady(true),
-        onLatency: (ms) => {
-          setLatencyMs(ms);
-          if (manualPing.current) {
-            manualPing.current = false;
-            addLog("system", `Round trip: ${ms.toFixed(1)} ms`);
-          }
-        },
-        onClosed: () => {
-          clearInterval(pinger);
-          setLatencyMs(undefined);
-          setPeerReady(false);
-          if (!alive) return;
-          if (session.peerLeft) {
-            const dropped = queue.clear().length;
-            if (dropped) addLog("system", `${dropped} queued file(s) weren't sent.`);
-            setPhase("closed");
-            return;
-          }
-          // Not a goodbye: the connection dropped. Get it back (D50)
-          setPhase("reconnecting");
-          link
-            .reconnect()
-            .then(attach)
-            .catch((err: unknown) => {
-              if (!alive) return;
-              queue.clear();
-              setError((err as Error).message);
-              setPhase("closed");
-            });
-        },
-      },
-      () => link.drop(), // a transfer stalled: the connection is dead
-    );
-    sessionRef.current = session;
+    const updatePeers = () =>
+      setPeers(
+        [...sessions].map(([id, s]) => ({ id, name: s.peerName, connected: s.connected })),
+      );
 
-    // Interrupted sends are retried after reconnecting; resume means only
-    // the missing part goes again (#19)
-    const queue = new SendQueue(async (file) => {
+    const remove = (peerId: string, why: string) => {
+      const session = sessions.get(peerId);
+      clearTimeout(lostTimers.get(peerId));
+      lostTimers.delete(peerId);
+      latencies.delete(peerId);
+      if (!session) return;
+      sessions.delete(peerId);
+      session.transfers.close("peer left");
+      addLog("system", `${session.peerName} ${why}`);
+      updatePeers();
+    };
+
+    const createSession = (peerId: string): Session => {
+      let introduced = false;
+      const session: Session = new Session(
+        {
+          onChat: (text) => addLog("peer", text, session.peerName),
+          onNotice: (text) => addLog("system", text),
+          onTransfer: (t) => {
+            if (t.status !== "streaming") recordTransfer(t); // reported once, when it ends
+            const key = `${peerId}:${t.id}`;
+            const row: PeerTransfer = { ...t, key, peerName: session.peerName };
+            setTransfers((list) => {
+              const i = list.findIndex((x) => x.key === key);
+              return i === -1 ? [...list, row] : list.with(i, row);
+            });
+          },
+          onPeerReady: () => {
+            if (!introduced) addLog("system", `${session.peerName} joined.`);
+            introduced = true;
+            updatePeers();
+          },
+          onLatency: (ms) => {
+            latencies.set(peerId, ms);
+            setLatencyMs(Math.max(...latencies.values()));
+            if (manualPing.current) {
+              manualPing.current = false;
+              addLog("system", `Round trip: ${ms.toFixed(1)} ms`);
+            }
+          },
+          onClosed: () => {
+            latencies.delete(peerId);
+            updatePeers();
+            if (!alive) return;
+            if (session.peerLeft) {
+              mesh.forget(peerId);
+              remove(peerId, "left.");
+              return;
+            }
+            // Not a goodbye: the connection dropped. The mesh reconnects (D50)
+            addLog("system", `Connection to ${session.peerName} lost. Reconnecting…`);
+            lostTimers.set(
+              peerId,
+              setTimeout(() => {
+                mesh.forget(peerId);
+                remove(peerId, "didn't come back.");
+              }, RECONNECT_TIMEOUT_MS),
+            );
+          },
+        },
+        () => mesh.drop(peerId), // a transfer stalled: that connection is dead
+        name,
+        peerId,
+      );
+      return session;
+    };
+
+    const mesh = new Mesh(
+      roomId,
+      (event) => {
+        if (!alive) return;
+        switch (event.type) {
+          case "connected": {
+            clearTimeout(lostTimers.get(event.peerId));
+            lostTimers.delete(event.peerId);
+            let session = sessions.get(event.peerId);
+            const reconnect = session !== undefined;
+            if (!session) {
+              session = createSession(event.peerId);
+              sessions.set(event.peerId, session);
+            }
+            session.attach(event.channel);
+            if (reconnect) addLog("system", `Reconnected to ${session.peerName}.`);
+            setEverConnected(true);
+            setError(undefined);
+            updatePeers();
+            session.ping();
+            break;
+          }
+          case "gone":
+            remove(event.peerId, "left the room.");
+            break;
+          case "unreachable":
+            addLog("system", `Can't reach peer-${event.peerId.slice(0, 4)}: ${event.message}`);
+            break;
+          case "fatal":
+            setError(event.message);
+            break;
+        }
+      },
+      setMeshPhase,
+    );
+
+    // Each file goes to everyone connected, in parallel (#27); interrupted
+    // sends are retried after reconnecting, resuming where they stopped (#19)
+    const sendWithRetry = async (session: Session, file: File) => {
       for (let attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt++) {
         const generation = session.generation;
         const t = await session.transfers.sendFile(file, session.sendOptions());
         if (!t.interrupted || attempt === MAX_SEND_ATTEMPTS) return;
         if (!(await session.waitReady(generation, RETRY_WAIT_MS))) return;
       }
+    };
+    const queue = new SendQueue(async (file) => {
+      const targets = [...sessions.values()].filter((s) => s.connected && s.canSendFiles());
+      if (targets.length === 0) {
+        addLog("system", `Nobody is connected; ${file.name} wasn't sent.`);
+        return;
+      }
+      await Promise.all(targets.map((s) => sendWithRetry(s, file)));
     }, setQueued);
     queueRef.current = queue;
 
-    const attach = (channel: PeerChannel) => {
-      if (!alive) return;
-      session.attach(channel);
-      setError(undefined);
-      setPhase("connected");
-      session.ping();
-      clearInterval(pinger);
-      pinger = setInterval(() => session.ping(), LATENCY_INTERVAL_MS);
+    const sayBye = () => {
+      for (const s of sessions.values()) s.sayBye();
     };
-
     // Closing the tab is leaving on purpose, not a network failure
-    const onPageHide = () => session.sayBye();
-    addEventListener("pagehide", onPageHide);
+    addEventListener("pagehide", sayBye);
 
-    link
-      .open(abort.signal)
-      .then(attach)
-      .catch((err: unknown) => {
-        if (abort.signal.aborted) return;
-        setError((err as Error).message);
-        setPhase("error");
-      });
+    mesh.start(abort.signal).catch((err: unknown) => {
+      if (abort.signal.aborted) return;
+      setError((err as Error).message);
+    });
+    const pinger = setInterval(() => {
+      for (const s of sessions.values()) if (s.connected) s.ping();
+    }, LATENCY_INTERVAL_MS);
 
     return () => {
       alive = false;
-      removeEventListener("pagehide", onPageHide);
-      session.sayBye();
+      removeEventListener("pagehide", sayBye);
+      sayBye();
       abort.abort();
       clearInterval(pinger);
+      for (const timer of lostTimers.values()) clearTimeout(timer);
       queue.clear();
-      // Give the bye a moment to leave before the connection closes
+      // Give the byes a moment to leave before the connections close
       setTimeout(() => {
-        session.close();
-        link.close();
+        for (const s of sessions.values()) s.close();
+        sessions.clear();
+        mesh.close();
       }, 100);
-      sessionRef.current = undefined;
     };
-  }, [roomId, isCreator, addLog]);
+  }, [roomId, addLog]);
 
   const sendChat = useCallback(
     (text: string) => {
-      sessionRef.current?.sendChat(text);
+      // Group chat (#24) over the broadcast primitive (#25)
+      let reached = 0;
+      for (const s of sessionsRef.current.values()) {
+        try {
+          s.sendChat(text);
+          reached++;
+        } catch {
+          // that connection is down
+        }
+      }
       addLog("me", text);
+      if (reached === 0) addLog("system", "Nobody is connected; that wasn't sent.");
     },
     [addLog],
   );
 
   const sendFiles = useCallback((files: File[]) => queueRef.current?.add(files), []);
   const unqueue = useCallback((id: string) => queueRef.current?.remove(id), []);
-  const cancel = useCallback((id: string) => sessionRef.current?.transfers.cancel(id), []);
+  const cancel = useCallback((key: string) => {
+    const [peerId, transferId] = key.split(":");
+    sessionsRef.current.get(peerId!)?.transfers.cancel(transferId!);
+  }, []);
   const ping = useCallback(() => {
     manualPing.current = true;
-    sessionRef.current?.ping();
+    for (const s of sessionsRef.current.values()) if (s.connected) s.ping();
   }, []);
 
+  const anyConnected = peers.some((p) => p.connected);
+  const phase: Phase =
+    error && !everConnected
+      ? "error"
+      : anyConnected
+        ? "connected"
+        : peers.length > 0 && everConnected
+          ? "reconnecting"
+          : everConnected
+            ? "closed"
+            : meshPhase;
   const busy = queued.length > 0 || transfers.some((t) => t.status === "streaming");
 
   return {
@@ -169,8 +282,9 @@ export function useRoom(roomId: string, isCreator: boolean) {
     log,
     transfers,
     queued,
-    peerReady,
-    latencyMs,
+    peers,
+    peerReady: anyConnected,
+    latencyMs: anyConnected ? latencyMs : undefined,
     busy,
     sendChat,
     sendFiles,

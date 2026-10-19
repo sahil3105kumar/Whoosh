@@ -19,8 +19,10 @@ DEFAULT_ROOM_TTL_SECONDS: int = 10 * 60
 #: is the first thing to revisit.
 _ROOM_ID_BYTES = 4
 
-#: Maximum number of peers allowed in a room (v1 is strictly 1-to-1).
-_MAX_PEERS = 2
+#: Default maximum peers per room. Every pair holds its own WebRTC
+#: connection (a full mesh), so cost grows with the square of this
+#: (docs/decisions.md D55).
+DEFAULT_MAX_PEERS = 8
 
 
 def _generate_room_id() -> str:
@@ -30,7 +32,13 @@ def _generate_room_id() -> str:
 class RoomManager:
     """In-memory registry of active signaling rooms."""
 
-    def __init__(self, *, ttl_seconds: int = DEFAULT_ROOM_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        *,
+        ttl_seconds: int = DEFAULT_ROOM_TTL_SECONDS,
+        max_peers: int = DEFAULT_MAX_PEERS,
+    ) -> None:
+        self._max_peers = max_peers
         self._rooms: dict[str, Room] = {}
         self._ttl_seconds = ttl_seconds
 
@@ -76,19 +84,19 @@ class RoomManager:
         """Add a peer to a room.
 
         Transitions room state: CREATED -> WAITING (1 peer),
-        WAITING -> CONNECTED (2 peers). Raises RoomFullError if
+        WAITING -> CONNECTED (2+ peers). Raises RoomFullError if
         the room already has the maximum number of peers.
         """
         room = self.get_room(room_id)
 
-        if len(room.peer_ids) >= _MAX_PEERS:
+        if len(room.peer_ids) >= self._max_peers:
             raise RoomFullError(room_id)
 
         room.peer_ids.add(peer_id)
 
         if len(room.peer_ids) == 1:
             room.state = RoomState.WAITING
-        elif len(room.peer_ids) == 2:
+        else:
             room.state = RoomState.CONNECTED
 
         return room

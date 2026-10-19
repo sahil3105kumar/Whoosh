@@ -28,6 +28,9 @@ class HelloPayload(Payload):
     """Capability negotiation sent immediately after the DataChannel opens."""
 
     capabilities: list[Capability]
+    #: Display name shown to the other peers (#26). Self-chosen, so it's a
+    #: label, not an identity.
+    name: str | None = None
 
 
 class ChatPayload(Payload):

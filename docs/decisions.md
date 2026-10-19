@@ -735,3 +735,56 @@ write it (full disk, blocked storage) are silent.
 **Note** — The test suite sets `WHOOSH_NO_HISTORY` for everything except
 history's own tests; otherwise the interop tests' CLI processes would
 write into the developer's real history.
+
+---
+
+## v3.0 — Multi-peer rooms
+
+### D55. Full mesh, up to 8 peers; the smaller peer_id offers
+*2026-10-19 — #23*
+
+**Decision** — Every pair of peers in a room has its own WebRTC
+connection. Rooms hold up to 8 people (`WHOOSH_MAX_PEERS`). Signaling
+messages are addressed (`to`, server-stamped `from`). In each pair the
+peer with the lexicographically smaller `peer_id` makes the offers; the
+other accepts any offer from it. Clients keep one protocol `Session` per
+peer, so resume, acks, retries and history work per pair unchanged.
+**Why** —
+- *Mesh, not a relay:* a relay (SFU-style) through the server would
+  break "the server only introduces you" and turn it into a bandwidth
+  bill. A mesh keeps all data peer-to-peer.
+- *The cap:* the cost grows with pairs (n·(n−1)/2) and each sender
+  uploads once per recipient. 8 keeps that sane for files and chat.
+- *Offer rule:* creator/joiner roles don't generalise to N peers, and
+  "who arrived first" is ambiguous after reconnects. Comparing ids is
+  deterministic, needs no coordination, and survives reconnects.
+**Revisit** — Larger rooms or video would need an SFU.
+
+### D56. Group chat and broadcast fan out over the pairs; membership comes from signaling
+*2026-10-19 — #24, #25, #26*
+
+**Decision** — "Broadcast" (#25) is a room-level helper that sends the
+same message on every connected pair's channel; group chat (#24) and
+room-wide ping are built on it. Membership (#26) comes from the
+signaling server (`hello.peers`, `peer_joined`, `peer_left`) plus the
+P2P connection state, and `hello` gains an optional display `name`. The
+UI lists who's here (connected / reconnecting) and announces joins and
+departures.
+**Why** — There's no shared channel in a mesh, so a broadcast *is* a
+fan-out. #26 mentions `PEER_JOIN` / `PEER_LEAVE` protocol messages; those
+were removed in D13, since presence is something only the signaling
+server sees for everyone. Names are self-chosen labels, not identities:
+proving who someone is belongs to v4.0 (device verification).
+
+### D57. "Distribute a file to the room" = one transfer per recipient, in parallel
+*2026-10-19 — #27*
+
+**Decision** — Sending a file in a multi-peer room sends it to every
+connected peer at once, each as an ordinary transfer with its own
+progress, resume and retries. The CLI's `send --peers N` waits for N
+people first. Receivers judge each file by its last attempt.
+**Why** — It reuses everything v2.0 built per pair. A swarm (recipients
+re-sharing chunks with each other, BitTorrent-style) would cut the
+sender's upload, but needs chunk maps, peer selection and partial-file
+serving: a large protocol for rooms of at most 8.
+**Revisit** — If the sender's upload becomes the bottleneck in practice.

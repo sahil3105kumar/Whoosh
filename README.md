@@ -110,6 +110,10 @@ whoosh receive <room code>        # on the other machine
 ```
 
 Or chat: `whoosh create` / `whoosh join <room code>`, then `/send PATH`.
+Rooms hold up to 8 people: chat goes to everyone, and a file sent in a
+room goes to everyone in it (`whoosh send --peers 3 file.zip` waits for
+three people). Pick a display name with `--name`.
+
 `whoosh history` lists past transfers (kept only on your machine).
 
 Interrupted transfers resume where they stopped, and a dropped

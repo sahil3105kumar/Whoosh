@@ -32,10 +32,10 @@ from pathlib import Path
 from websockets.exceptions import WebSocketException
 
 from apps.cli import history
-from apps.cli.connection import RECONNECT_TIMEOUT, ConnectError, Link, create_room
+from apps.cli.connection import ConnectError, Mesh, create_room
 from apps.cli.queue import SendQueue
-from apps.cli.session import Session, Ui, format_bytes
-from packages.protocol.enums import Capability
+from apps.cli.room import Room
+from apps.cli.session import Ui, format_bytes
 from packages.transfer.manager import Transfer, TransferStatus
 
 log = logging.getLogger(__name__)
@@ -43,11 +43,13 @@ log = logging.getLogger(__name__)
 DEFAULT_SERVER = "http://localhost:8000"
 
 HELP = """\
-Type a message and press Enter to chat. Commands:
-  /send PATH [PATH ...]   queue files to send, one at a time (quote paths with spaces)
+Type a message and press Enter to chat with everyone in the room. Commands:
+  /send PATH [PATH ...]   send files to everyone here, one file at a time
+                          (quote paths with spaces)
   /queue                  show the file being sent and those waiting
-  /cancel                 cancel the current transfer and clear the queue
-  /ping                   measure round-trip time
+  /cancel                 cancel current transfers and clear the queue
+  /peers                  list who's in the room
+  /ping                   measure round-trip time to everyone
   /quit                   leave"""
 
 #: How long to wait for the peer's hello before sending files.
@@ -100,49 +102,28 @@ def _stdin_lines() -> asyncio.Queue[str | None]:
 # ── Modes ───────────────────────────────────────────────────────────
 
 
-async def _stay_connected(link: Link, session: Session, ui: Ui) -> str:
-    """Run the session, reconnecting whenever the connection drops (D50).
-    Returns why it ended: "left" (the other side said bye) or "lost"."""
-    while True:
-        await session.run_inbound()  # until this connection ends
-        if session.peer_left:
-            return "left"
-        ui.hint("Connection lost. Reconnecting...")
-        try:
-            peer = await link.reconnect()
-        except ConnectError as exc:
-            ui.error(str(exc))
-            return "lost"
-        session.attach(peer)
-        ui.ok("Reconnected.")
-
-
-async def _interactive(link: Link, session: Session, ui: Ui) -> None:
-    ui.ok("Connected peer-to-peer.")
+async def _interactive(room: Room, ui: Ui) -> None:
     ui.hint("Type a message and press Enter, /send PATH to send files, /help for more.")
-    queue = SendQueue(lambda path: _send_with_retry(session, path, ui))
-    connection = asyncio.create_task(_stay_connected(link, session, ui))
-    commands = asyncio.create_task(_command_loop(session, queue, ui))
-
+    queue = SendQueue(lambda path: _send_to_all(room, path, ui))
+    commands = asyncio.create_task(_command_loop(room, queue, ui))
     try:
-        done, _ = await asyncio.wait({connection, commands}, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            task.result()  # re-raise failures
-        if connection in done and connection.result() == "left":
-            ui.line("The other person left.")
+        await commands
     finally:
-        session.say_bye()
+        room.say_bye()
         dropped = queue.clear()
         if dropped:
             ui.hint(f"{len(dropped)} queued file(s) weren't sent.")
-        for transfer in session.transfers.transfers:
-            session.transfers.cancel(transfer.id, "session ended")
         await queue.close()
-        for task in (connection, commands):
-            task.cancel()
 
 
-async def _command_loop(session: Session, queue: SendQueue, ui: Ui) -> None:
+async def _send_to_all(room: Room, path: Path, ui: Ui) -> None:
+    if not room.connected():
+        ui.hint(f"Nobody is connected; {path.name} wasn't sent.")
+        return
+    await room.send_to_all(path)
+
+
+async def _command_loop(room: Room, queue: SendQueue, ui: Ui) -> None:
     lines = _stdin_lines()
 
     while (line := await lines.get()) is not None:
@@ -150,16 +131,17 @@ async def _command_loop(session: Session, queue: SendQueue, ui: Ui) -> None:
         if not line:
             continue
         try:
-            if not _command(line, session, queue, ui):
+            if not _command(line, room, queue, ui):
                 return
         except ConnectionError:
             ui.hint("Not connected right now (reconnecting); that wasn't sent.")
 
 
-def _command(line: str, session: Session, queue: SendQueue, ui: Ui) -> bool:
+def _command(line: str, room: Room, queue: SendQueue, ui: Ui) -> bool:
     """Handle one line of input. False means quit."""
     if not line.startswith("/"):
-        session.send_chat(line)
+        if not room.broadcast(lambda s: s.send_chat(line)):  # group chat (#24)
+            ui.hint("Nobody is connected yet; that wasn't sent.")
         return True
 
     cmd, _, arg = line.partition(" ")
@@ -168,20 +150,24 @@ def _command(line: str, session: Session, queue: SendQueue, ui: Ui) -> bool:
     elif cmd == "/help":
         ui.line(HELP)
     elif cmd == "/ping":
-        session.ping()
+        room.broadcast(lambda s: s.ping())
+    elif cmd == "/peers":
+        _show_peers(room, ui)
     elif cmd == "/queue":
         _show_queue(queue, ui)
     elif cmd == "/cancel":
         dropped = queue.clear()
-        cancelled = [t for t in session.transfers.transfers if session.transfers.cancel(t.id)]
+        cancelled = [
+            t
+            for s in room.sessions.values()
+            for t in s.transfers.transfers
+            if s.transfers.cancel(t.id)
+        ]
         if not cancelled and not dropped:
             ui.hint("Nothing to cancel.")
         elif dropped:
             ui.hint(f"Removed {len(dropped)} queued file(s).")
     elif cmd == "/send":
-        if not session.peer_can(Capability.FILE_TRANSFER):
-            ui.error("The other side doesn't support file transfer.")
-            return True
         paths = _parse_paths(arg, ui)
         if paths:
             busy = queue.current is not None
@@ -191,6 +177,15 @@ def _command(line: str, session: Session, queue: SendQueue, ui: Ui) -> bool:
     else:
         ui.error(f"Unknown command {cmd}. Type /help for the list.")
     return True
+
+
+def _show_peers(room: Room, ui: Ui) -> None:
+    if not room.sessions:
+        ui.hint("Nobody else is here yet.")
+        return
+    for session in room.sessions.values():
+        state = "connected" if session.connected.is_set() else "reconnecting"
+        ui.line(f"  {session.peer_name}  {ui.style.dim(state)}")
 
 
 def _show_queue(queue: SendQueue, ui: Ui) -> None:
@@ -224,62 +219,32 @@ def _parse_paths(arg: str, ui: Ui) -> list[Path]:
     return paths
 
 
-#: Attempts per file when the connection keeps dropping (#19).
-MAX_SEND_ATTEMPTS = 3
-
-
-async def _send_with_retry(session: Session, path: Path, ui: Ui) -> Transfer | None:
-    """Send ``path``; if the connection drops, wait for the reconnect and
-    send it again. Resume means the retry only sends what's missing."""
-    for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
-        generation = session.generation
-        try:
-            transfer = await session.transfers.send_file(path, **session.send_options())
-        except OSError as exc:
-            ui.error(f"{path}: {exc}")
-            return None
-        if not transfer.interrupted or attempt == MAX_SEND_ATTEMPTS:
-            return transfer
-        ui.hint(
-            f"{path.name} will continue after reconnecting "
-            f"(retry {attempt} of {MAX_SEND_ATTEMPTS - 1})."
-        )
-        if not await session.wait_ready(after=generation, timeout=RECONNECT_TIMEOUT + 30):
-            return transfer
-    return None
-
-
-async def _send_files(link: Link, session: Session, paths: list[Path], ui: Ui) -> bool:
-    connection = asyncio.create_task(_stay_connected(link, session, ui))
+async def _send_files(room: Room, paths: list[Path], peers: int, ui: Ui) -> bool:
+    """Wait for ``peers`` people, send every file to all of them, leave."""
+    await room.wait_for_peers(peers)
+    ok = True
     try:
-        if not await session.wait_ready(after=-1, timeout=_HELLO_TIMEOUT):
-            ui.error("The other side connected but never responded.")
-            return False
-        if not session.peer_can(Capability.FILE_TRANSFER):
-            ui.error("The other side doesn't support file transfer.")
-            return False
-
-        ok = True
         for i, path in enumerate(paths, 1):
             if len(paths) > 1:
                 ui.hint(f"File {i} of {len(paths)}")
-            transfer = await _send_with_retry(session, path, ui)
-            ok &= transfer is not None and transfer.status is TransferStatus.COMPLETED
-            if connection.done():
-                break  # the other side is gone; the rest can't go
+            recipients = len(room.connected())
+            transfers = await room.send_to_all(path)
+            ok &= len(transfers) == recipients and all(
+                t.status is TransferStatus.COMPLETED for t in transfers
+            )
+            if not room.connected():
+                break  # everyone is gone; the rest can't go
         return ok
     finally:
-        session.say_bye()
-        await asyncio.sleep(0.2)  # let the bye leave before the connection closes
-        connection.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await connection
+        room.say_bye()
+        await asyncio.sleep(0.2)  # let the bye leave before the connections close
 
 
-async def _receive_files(link: Link, session: Session, ui: Ui) -> bool:
+async def _receive_files(room: Room, ui: Ui) -> bool:
+    await room.wait_for_peers(1)
     ui.ok("Connected peer-to-peer. Waiting for files...")
-    await _stay_connected(link, session, ui)  # until the sender says bye or is lost
-    transfers = session.transfers.transfers
+    await room.wait_until_empty()  # until the senders say bye or are lost
+    transfers = [t for s in room.everyone() for t in s.transfers.transfers]
     if not transfers:
         ui.error("The sender disconnected without sending anything.")
         return False
@@ -309,29 +274,26 @@ async def _run(args: argparse.Namespace, server: str, ui: Ui) -> bool:
         room_id = args.room.code
         ui.hint(f"Joining room {room_id}...")
 
-    link = Link(server, room_id, is_creator=is_creator)
-    background: set[asyncio.Task[None]] = set()
-
-    def drop_stalled() -> None:
-        # A transfer stalled: the connection is dead even if it hasn't said so
-        task = asyncio.create_task(link.drop())
-        background.add(task)
-        task.add_done_callback(background.discard)
-
+    mesh = Mesh(server, room_id)
+    out = Path(getattr(args, "out", ".")).expanduser()
+    room = Room(mesh, ui, out, args.name)
+    await mesh.start()
+    events = asyncio.create_task(room.run())
     try:
-        peer = await link.open()
-        out = Path(getattr(args, "out", ".")).expanduser()
-        session = Session(peer, out, ui, on_stall=drop_stalled)
-        session.start()
-
         if args.cmd in ("create", "join"):
-            await _interactive(link, session, ui)
+            if args.cmd == "join":
+                await room.wait_for_peers(1)
+                ui.ok("Connected peer-to-peer.")
+            await _interactive(room, ui)
             return True
         if args.cmd == "send":
-            return await _send_files(link, session, args.files, ui)
-        return await _receive_files(link, session, ui)
+            return await _send_files(room, args.files, args.peers, ui)
+        return await _receive_files(room, ui)
     finally:
-        await link.close()
+        events.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await events
+        await room.close()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -347,6 +309,7 @@ def _parser() -> argparse.ArgumentParser:
         help=f"Signaling server URL (default: $WHOOSH_SERVER or {DEFAULT_SERVER})",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    p.add_argument("--name", help="Name shown to the other people in the room")
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
 
     out_help = "Directory for received files (default: current directory)"
@@ -358,6 +321,13 @@ def _parser() -> argparse.ArgumentParser:
     j.add_argument("--out", default=".", help=out_help)
     s = sub.add_parser("send", help="Create a room, send files, exit")
     s.add_argument("files", nargs="+", type=Path)
+    s.add_argument(
+        "--peers",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Wait for N people to join, then send to all of them (default 1)",
+    )
     r = sub.add_parser("receive", help="Join a room, save incoming files, exit")
     r.add_argument("room", type=room_ref, help=room_help)
     r.add_argument("--out", default=".", help=out_help)

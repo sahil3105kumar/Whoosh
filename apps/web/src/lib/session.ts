@@ -52,10 +52,17 @@ export class Session {
   peerLeft = false;
   private readyWaiters: (() => void)[] = [];
 
+  /** How the other peer is shown: its chosen name once its hello arrives. */
+  peerName: string;
+
   constructor(
     private readonly events: SessionEvents,
     onStall?: () => void,
+    /** Our display name, sent in hello. */
+    private readonly name?: string,
+    peerId = "",
   ) {
+    this.peerName = peerId ? `peer-${peerId.slice(0, 4)}` : "peer";
     this.transfers = new TransferManager(notConnected, events.onTransfer, { onStall });
   }
 
@@ -77,7 +84,7 @@ export class Session {
       this.transfers.close("connection closed");
       this.events.onClosed();
     });
-    this.send("hello", { capabilities: CAPABILITIES });
+    this.send("hello", { capabilities: CAPABILITIES, name: this.name || null });
   }
 
   get connected(): boolean {
@@ -163,6 +170,7 @@ export class Session {
       case "hello":
         if (!this.peerCapabilities) {
           this.peerCapabilities = new Set(msg.payload.capabilities);
+          if (msg.payload.name) this.peerName = cleanName(msg.payload.name);
           this.events.onPeerReady(msg.payload.capabilities);
           for (const wake of this.readyWaiters.splice(0)) wake();
         }
@@ -195,4 +203,10 @@ export class Session {
     console.warn(`bad input from peer (${code}): ${message}`);
     this.send("error", { code, message });
   }
+}
+
+/** A peer's self-chosen name, made safe to show: printable, at most 32 characters. */
+export function cleanName(name: string): string {
+  const printable = [...name].filter((c) => !/[\p{C}]/u.test(c)).join("").trim();
+  return printable.slice(0, 32) || "peer";
 }

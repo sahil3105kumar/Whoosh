@@ -238,3 +238,32 @@ async def test_hello_lists_peers_already_connected():
                 async with aconnect_ws(f"/rooms/{room_id}/ws", client2) as second:
                     second_hello = await second.receive_json()
                     assert second_hello["peers"] == [first_hello["peer_id"]]
+
+
+async def test_addressed_signaling_reaches_only_its_target():
+    room_id = await _create_room()
+    async with _http_client() as c1, _http_client() as c2, _http_client() as c3:
+        async with (
+            aconnect_ws(f"/rooms/{room_id}/ws", c1) as a,
+            aconnect_ws(f"/rooms/{room_id}/ws", c2) as b,
+            aconnect_ws(f"/rooms/{room_id}/ws", c3) as c,
+        ):
+            a_id = (await a.receive_json())["peer_id"]
+            b_id = (await b.receive_json())["peer_id"]
+            await c.receive_json()
+            # drain peer_joined notices
+            for _ in range(2):
+                await a.receive_json()
+            await b.receive_json()
+
+            await a.send_json({"type": "offer", "sdp": "for-b", "to": b_id})
+            msg = await b.receive_json()
+            assert msg == {"type": "offer", "sdp": "for-b", "to": b_id, "from": a_id}
+
+            await a.send_json({"type": "offer", "sdp": "x", "to": "nobody"})
+            err = await a.receive_json()
+            assert err["type"] == "error" and "nobody" in err["reason"]
+
+            # c got nothing addressed to b
+            await a.send_json({"type": "offer", "sdp": "for-c-probe", "to": b_id})
+            assert (await b.receive_json())["sdp"] == "for-c-probe"

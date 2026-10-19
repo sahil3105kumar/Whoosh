@@ -8,7 +8,13 @@ DataChannel. It carries two kinds of frames:
 
 The signaling server's WebSocket messages (`offer`, `answer`, `ice`,
 `peer_joined`, `peer_disconnected`, `peer_left`, `error`) are a separate
-protocol and never cross the DataChannel.
+protocol and never cross the DataChannel; see [Rooms and
+signaling](#rooms-and-signaling).
+
+Rooms hold up to 8 people as a **full mesh**: every pair of peers has its
+own connection and DataChannel, and everything in this document happens
+per pair. Room-wide actions (group chat, sending a file to everyone) are
+the same message sent on each pair's channel.
 
 ## Envelope
 
@@ -30,7 +36,11 @@ Every text frame is one message in the same envelope.
 ### hello
 
 Sent by both peers as soon as the channel opens.
-`{"capabilities": ["chat", "file_transfer", "cancel", "resume", "ack"]}`
+`{"capabilities": ["chat", "file_transfer", "cancel", "resume", "ack"], "name": "alice" | null}`
+
+`name` is the display name shown to others; it's self-chosen, so it's a
+label, not an identity. Receivers strip control characters and cap it at
+32 characters.
 
 Optional behaviour (like `resume`) is used only when *both* peers
 advertise it, so clients with different feature sets still interoperate.
@@ -173,6 +183,20 @@ The sender hashes the skipped prefix locally, so the final SHA-256 still
 covers the whole file. Partial data is kept when the connection drops,
 and deleted on `transfer_cancel` or any integrity failure.
 
+## Rooms and signaling
+
+* On connecting, the server sends `{"type": "hello", "peer_id": ..., "peers": [...]}`:
+  our slot, plus the peers already connected. Peers that arrive later
+  are announced with `peer_joined`; `peer_left` means a slot was released
+  (left, or gone longer than the 30 s grace period).
+* `offer` / `answer` / `ice` carry `"to": "<peer_id>"`; the server
+  delivers them to that peer only, adding `"from": "<sender>"`. (Without
+  `to` they go to everyone, which only makes sense in a 1:1 room.)
+* **In each pair, the peer with the smaller `peer_id` makes the offer**,
+  whenever that pair isn't connected and both are on signaling. The
+  other side accepts any offer from that peer, replacing its old
+  connection.
+
 ## Reconnection
 
 When the peer-to-peer connection drops without a `bye` (lost network,
@@ -181,10 +205,10 @@ in the room and reconnect:
 
 * A dropped signaling WebSocket reconnects with `?peer_id=` to reclaim
   its slot.
-* The room creator sends a fresh offer whenever the connection is down
-  and both peers are on signaling (on its own reconnect, on
-  `peer_joined`, and shortly after a drop). The joiner accepts any new
-  offer, replacing its old connection.
+* The offering side of the pair (smaller `peer_id`) sends a fresh offer
+  whenever the pair is down and both peers are on signaling (on its own
+  reconnect, on `peer_joined`, and shortly after a drop). The other side
+  accepts any new offer, replacing its old connection.
 * On the new connection both sides send `hello` again. Interrupted
   outgoing transfers are re-sent (up to 3 attempts per file) and resume
   from the receiver's partial copy.
