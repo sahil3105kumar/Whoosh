@@ -59,8 +59,9 @@ from packages.protocol.models import (
     TransferCompletePayload,
     make_message,
 )
+from packages.transfer.chunking import ChunkSizer
 from packages.transfer.filenames import safe_filename, unique_path
-from packages.transfer.frames import CHUNK_SIZE, decode_frame, encode_chunk
+from packages.transfer.frames import decode_frame, encode_chunk
 from packages.transfer.resume import SAMPLE, PartialStore, is_resume_key, resume_key
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,10 @@ ACK_WINDOW = 8 * 1024 * 1024
 #: A sender with a full window and no ack for this long gives up: the
 #: receiver or the path to it has stopped working.
 DEFAULT_STALL_TIMEOUT = 20.0
+
+#: Largest frame assumed when the channel doesn't say: aiortc's limit,
+#: which every DataChannel implementation accepts.
+DEFAULT_MAX_MESSAGE = 65536
 
 #: Minimum seconds between progress callbacks for one transfer.
 _REPORT_INTERVAL = 0.1
@@ -279,7 +284,9 @@ class TransferManager:
         transfer.bytes_done = transfer.resumed_from = transfer.bytes_acked = offset
 
     async def _stream(self, transfer: Transfer, f: IO[bytes], offset: int) -> None:
-        while chunk := f.read(CHUNK_SIZE):
+        # Adaptive chunk size, capped by what the connection can carry (D52)
+        sizer = ChunkSizer(getattr(self._channel, "max_message_size", DEFAULT_MAX_MESSAGE))
+        while chunk := f.read(sizer.size):
             if transfer.acked and not await self._window_open(transfer):
                 return
             await self._channel.drain()
@@ -290,6 +297,7 @@ class TransferManager:
             transfer._hash.update(chunk)
             offset += len(chunk)
             transfer.bytes_done = offset
+            sizer.sent(len(chunk), time.monotonic())
             self._report(transfer)
 
         if offset != transfer.size:

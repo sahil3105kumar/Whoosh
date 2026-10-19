@@ -98,6 +98,12 @@ class WebRTCPeer:
         return await self._inbox.get()
 
     @property
+    def max_message_size(self) -> int:
+        """Largest message to send. aiortc accepts (and advertises) 64 KiB;
+        browsers accept at least that, so it's safe whoever the peer is."""
+        return 65536
+
+    @property
     def closed(self) -> bool:
         return self._closed
 

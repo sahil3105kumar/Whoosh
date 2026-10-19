@@ -46,6 +46,11 @@ export class PeerChannel implements Channel {
   get isClosed(): boolean {
     return this.closed;
   }
+
+  /** Largest message both ends accept (Chrome↔Chrome 256 KiB, with aiortc 64 KiB). */
+  get maxMessageSize(): number {
+    return this.pc.sctp?.maxMessageSize ?? 65536;
+  }
   private disconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(

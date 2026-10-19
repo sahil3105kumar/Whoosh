@@ -676,3 +676,44 @@ a connected WebSocket by a full TTL. Only rooms nobody is connected to
 expire.
 **Why** — D3's expiry counted from creation, so a session older than 10
 minutes couldn't reconnect after a drop: the room would be gone.
+
+### D52. Adaptive chunk sizing: hill-climb on throughput, capped by the connection
+*2026-10-19 — #21*
+
+**Decision** — Senders start at 16 KiB chunks and double the size while
+throughput, measured over ≥250 ms / ≥512 KiB windows, keeps improving by
+5%; they halve it if a window is 20% slower. Chunks are capped at
+256 KiB and at the connection's maximum message size: the browser reads
+`pc.sctp.maxMessageSize` (64 KiB with aiortc, 256 KiB Chrome↔Chrome);
+the CLI always assumes 64 KiB, aiortc's own limit. No protocol change:
+frames carry byte offsets, so receivers accept any size.
+**Measured** — 100 MB over localhost, each case run twice, against fixed
+16 KiB chunks: browser → CLI 13.2 → 14.0 MB/s, CLI → browser 20.8 →
+21.0 MB/s, browser → browser 35.1 → 35.1 MB/s. **No significant
+difference here**: the bottleneck is aiortc's Python SCTP stack (it
+splits every message into ~1200-byte fragments regardless), not message
+count. A first single-run comparison suggested a 26% regression for
+CLI → browser; repeating it showed that was noise.
+**Why keep it** — #21 asks for it; it's small, bounded and tested on
+both sides, and it can only help where per-message overhead dominates
+(high-bandwidth links between browsers). It must not be described as a
+measured speed-up.
+**Revisit** — The sender measures how fast data is *queued*, which only
+tracks delivery once the 8 MiB ack window (D49) is full; driving it from
+acknowledged bytes would be a better signal.
+
+### D53. Integrity verification is end-to-end SHA-256 (already in place)
+*2026-10-19 — #20*
+
+**Decision** — #20 is satisfied by D17: the sender's SHA-256 of the whole
+file travels in `transfer_complete` and the receiver verifies size and
+hash before the file appears under its final name. With resume (D46)
+the receiver re-hashes its stored prefix and the sender hashes the part
+it skipped, so the check still covers every byte. A mismatch discards
+the partial so a retry starts clean.
+**Why not in `file_metadata`, as #20 suggests** — putting the checksum
+up front would mean reading the whole file before sending its first
+byte (minutes, for a large file). At the end it's computed while
+streaming, for free. Per-chunk checksums would duplicate what DTLS
+(authenticated encryption) and SCTP (CRC32c) already guarantee in
+transit.

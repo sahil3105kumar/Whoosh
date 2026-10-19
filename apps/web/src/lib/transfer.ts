@@ -21,7 +21,8 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 
 import { safeFilename } from "./filenames";
-import { CHUNK_SIZE, decodeFrame, encodeChunk, newTransferId, uuidHex } from "./frames";
+import { ChunkSizer } from "./chunking";
+import { decodeFrame, encodeChunk, newTransferId, uuidHex } from "./frames";
 import { type Hasher, type Partial, isResumeKey, resumeKey, tabPartials } from "./resume";
 import {
   type FileMetadataPayload,
@@ -50,6 +51,8 @@ const READ_BLOCK = 1024 * 1024;
 const BLOB_FLUSH_BYTES = 8 * 1024 * 1024;
 
 export interface Channel {
+  /** Largest message the connection carries; 64 KiB if unknown. */
+  readonly maxMessageSize?: number;
   send(data: string | Uint8Array): void;
   /** Resolves when it's OK to send more; rejects with ConnectionClosedError. */
   drain(): Promise<void>;
@@ -267,18 +270,22 @@ export class TransferManager {
   }
 
   private async stream(st: TransferState, file: File, offset: number): Promise<void> {
+    // Adaptive chunk size, capped by what the connection can carry (D52)
+    const sizer = new ChunkSizer(this.channel.maxMessageSize ?? 65536);
     while (offset < st.size) {
       const block = new Uint8Array(await file.slice(offset, offset + READ_BLOCK).arrayBuffer());
       if (block.length === 0) throw new Error("file shrank while being sent");
-      for (let i = 0; i < block.length; i += CHUNK_SIZE) {
+      for (let i = 0; i < block.length; ) {
         if (st.acked && !(await this.windowOpen(st))) return;
         await this.channel.drain();
         // Either side may have cancelled while we waited for the buffer
         if (st.finished) return;
-        const chunk = block.subarray(i, i + CHUNK_SIZE);
+        const chunk = block.subarray(i, i + sizer.size);
         this.channel.send(encodeChunk(st.id, offset, chunk));
         st.hash.update(chunk);
+        i += chunk.length;
         offset += chunk.length;
+        sizer.sent(chunk.length, performance.now());
         st.bytesDone = offset;
         this.report(st);
       }
