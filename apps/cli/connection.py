@@ -1,12 +1,16 @@
 """
-Signaling + WebRTC for the CLI: get from a room id to an open DataChannel,
-and keep getting back there when the connection drops (#19, D50).
+Signaling + WebRTC for the CLI: one room, any number of peers (#23).
 
-``Link`` owns the signaling WebSocket and the current WebRTC connection.
-When the peer-to-peer connection dies, the room creator re-offers as soon
-as both sides are reachable through signaling, and the joiner accepts any
-new offer; a dropped WebSocket reconnects with its peer_id so it keeps its
-slot in the room.
+``Mesh`` owns the signaling WebSocket and a WebRTC connection to every
+other peer in the room (a full mesh, docs/decisions.md D55). Each pair
+reconnects on its own when its connection drops (D50): in every pair
+the peer with the smaller peer_id makes the offers, so the rule needs
+no coordination and survives reconnects. A dropped WebSocket reconnects
+with its peer_id so it keeps its slot in the room.
+
+The application consumes ``Mesh.events``: a peer connected (new, or
+back after a drop), a peer is gone, a peer couldn't be reached, or the
+room itself became unusable.
 """
 
 from __future__ import annotations
@@ -15,9 +19,9 @@ import asyncio
 import contextlib
 import json
 import logging
-import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 from typing import Any
 
 import websockets
@@ -33,7 +37,8 @@ log = logging.getLogger(__name__)
 #: Covers STUN candidate gathering plus ICE connectivity checks.
 CONNECT_TIMEOUT = 30.0
 
-#: How long ``reconnect`` keeps trying after the connection drops.
+#: How long a peer whose connection dropped (without saying bye) is given
+#: to come back before it's treated as gone.
 RECONNECT_TIMEOUT = 60.0
 
 #: WebSocket close code the server uses for "room not found / expired / full".
@@ -57,7 +62,7 @@ def explain_close(reason: str, room_id: str) -> str:
     if reason.startswith("Room expired"):
         return f"Room {room_id} has expired. Ask for a new code."
     if reason.startswith("Room is full"):
-        return f"Room {room_id} already has two people in it."
+        return f"Room {room_id} is full."
     return reason
 
 
@@ -81,102 +86,125 @@ def _fetch_rtc_config(server: str) -> RTCConfiguration:
     return RTCConfiguration(iceServers=[RTCIceServer(urls=s["urls"]) for s in ice_servers])
 
 
-_DIRECT_FAILED = (
+DIRECT_FAILED = (
     "Direct connection failed: no network path between the peers. "
     "One side is likely behind a strict NAT or firewall "
     "(relay servers aren't supported yet)."
 )
 
 
-# ── Link ────────────────────────────────────────────────────────────
+# ── Events ──────────────────────────────────────────────────────────
 
 
-class Link:
-    """A room's connection to the other peer, re-established when it drops."""
+@dataclass(frozen=True)
+class PeerConnected:
+    """An open connection to ``peer_id``: new, or replacing one that dropped."""
 
-    def __init__(self, server: str, room_id: str, *, is_creator: bool) -> None:
+    peer_id: str
+    peer: WebRTCPeer
+
+
+@dataclass(frozen=True)
+class PeerGone:
+    """``peer_id`` left the room for good (its slot was released)."""
+
+    peer_id: str
+
+
+@dataclass(frozen=True)
+class PeerUnreachable:
+    """Connecting to ``peer_id`` timed out; the offering side keeps retrying."""
+
+    peer_id: str
+    message: str
+
+
+@dataclass(frozen=True)
+class Fatal:
+    """The room can't be used any more (gone, full, server unreachable)."""
+
+    error: ConnectError
+
+
+MeshEvent = PeerConnected | PeerGone | PeerUnreachable | Fatal
+
+
+# ── Mesh ────────────────────────────────────────────────────────────
+
+
+@dataclass(eq=False)
+class _Pair:
+    """Our connection to one other peer."""
+
+    peer_id: str
+    #: The current WebRTC connection (maybe still negotiating)...
+    peer: WebRTCPeer | None = None
+    #: ...and the same object once its DataChannel is open.
+    ready: WebRTCPeer | None = None
+    retry: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    @property
+    def connected(self) -> bool:
+        return self.ready is not None and not self.ready.closed
+
+
+class Mesh:
+    def __init__(self, server: str, room_id: str) -> None:
         self.server = server
         self.room_id = room_id
-        self.is_creator = is_creator
+        self.events: asyncio.Queue[MeshEvent] = asyncio.Queue()
         self._ws_url = f"{server.replace('http', 'ws', 1)}/rooms/{room_id}/ws"
         self._rtc_config: RTCConfiguration | None = None
         self._ws: ClientConnection | None = None
         #: Our slot in the room, reused when the WebSocket reconnects.
-        self._peer_id: str | None = None
-        #: The current WebRTC connection (maybe still negotiating)...
-        self._peer: WebRTCPeer | None = None
-        #: ...and the same object once its DataChannel is open.
-        self._ready: WebRTCPeer | None = None
-        #: Creator: the other peer has been in the room, so it's worth offering.
-        self._other_seen = False
-        self._negotiation_started: float | None = None
-        self._last_ice_failed = False
-        #: Signaling can't work any more (room gone, server unreachable).
-        self._fatal: ConnectError | None = None
+        self.peer_id: str | None = None
+        self._pairs: dict[str, _Pair] = {}
+        #: Peers that said bye: don't reconnect to them.
+        self._forgotten: set[str] = set()
         self._closing = False
-        self._changed = asyncio.Event()
         self._tasks: set[asyncio.Task[Any]] = set()
         self._signaling: asyncio.Task[None] | None = None
 
     # ── Public API ──────────────────────────────────────────────────
 
-    async def open(self) -> WebRTCPeer:
-        """First connection. Waits indefinitely for the other person to
-        arrive, then CONNECT_TIMEOUT for the connection itself."""
+    async def start(self) -> None:
         self._rtc_config = await asyncio.to_thread(_fetch_rtc_config, self.server)
         self._signaling = asyncio.create_task(self._signaling_loop())
-        return await self._wait_ready(first=True)
 
-    async def reconnect(self, timeout: float = RECONNECT_TIMEOUT) -> WebRTCPeer:
-        """After the current connection closed: wait for a new one."""
-        if self.is_creator:
-            self._spawn(self._renegotiate_soon())
-        return await self._wait_ready(first=False, timeout=timeout)
+    def connected_peers(self) -> list[str]:
+        return [pid for pid, pair in self._pairs.items() if pair.connected]
 
-    async def drop(self) -> None:
-        """Abandon the current connection (it stalled), so a new one is made."""
-        if self._peer is not None:
-            await self._peer.close()
+    async def drop(self, peer_id: str) -> None:
+        """Abandon the connection to ``peer_id`` (it stalled), so a new one
+        is made."""
+        pair = self._pairs.get(peer_id)
+        if pair is not None and pair.peer is not None:
+            await pair.peer.close()
+
+    def forget(self, peer_id: str) -> None:
+        """``peer_id`` left on purpose: stop trying to reach it."""
+        self._forgotten.add(peer_id)
+        pair = self._pairs.pop(peer_id, None)
+        if pair is not None:
+            if pair.retry is not None:
+                pair.retry.cancel()
+            if pair.peer is not None:
+                self._spawn(pair.peer.close())
 
     async def close(self) -> None:
         self._closing = True
         tasks = [t for t in [self._signaling, *self._tasks] if t is not None]
+        tasks += [p.retry for p in self._pairs.values() if p.retry is not None]
         for task in tasks:
             task.cancel()
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-        if self._peer is not None:
-            await self._peer.close()
+        for pair in self._pairs.values():
+            if pair.peer is not None:
+                await pair.peer.close()
         if self._ws is not None:
             await self._ws.close()
-
-    # ── Waiting ─────────────────────────────────────────────────────
-
-    def _pulse(self) -> None:
-        """Wake everything waiting in _wait_ready to re-check the state."""
-        self._changed.set()
-        self._changed = asyncio.Event()
-
-    async def _wait_ready(self, *, first: bool, timeout: float | None = None) -> WebRTCPeer:
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            if self._ready is not None and not self._ready.closed:
-                return self._ready
-            if self._fatal is not None:
-                raise self._fatal
-            if first and deadline is None and self._negotiation_started is not None:
-                deadline = self._negotiation_started + CONNECT_TIMEOUT
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
-                if self._last_ice_failed:
-                    raise ConnectError(_DIRECT_FAILED)
-                if first:
-                    raise ConnectError("Timed out establishing the connection.")
-                raise ConnectError("Couldn't reconnect to the other person.")
-            changed = self._changed
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(changed.wait(), remaining)
 
     # ── Signaling ───────────────────────────────────────────────────
 
@@ -184,7 +212,7 @@ class Link:
         """Keep a signaling WebSocket open, reconnecting with our peer_id."""
         backoff = 0.5
         while not self._closing:
-            url = self._ws_url + (f"?peer_id={self._peer_id}" if self._peer_id else "")
+            url = self._ws_url + (f"?peer_id={self.peer_id}" if self.peer_id else "")
             reason, code = "", None
             try:
                 async with websockets.connect(url) as ws:
@@ -197,17 +225,17 @@ class Link:
                 if exc.rcvd is not None:
                     code, reason = exc.rcvd.code, exc.rcvd.reason
             except OSError as exc:
-                if self._peer_id is None:  # never got in at all
-                    self._set_fatal(f"Can't reach the signaling server at {self.server}: {exc}")
+                if self.peer_id is None:  # never got in at all
+                    self._fatal(f"Can't reach the signaling server at {self.server}: {exc}")
                     return
                 log.debug("signaling unreachable: %s", exc)
             finally:
                 self._ws = None
 
             if code == _POLICY_VIOLATION:
-                # Room gone, expired or full: reconnecting can't help. A live
-                # P2P connection is unaffected; it just can't be re-made.
-                self._set_fatal(explain_close(reason, self.room_id))
+                # Room gone, expired or full: reconnecting can't help. Live
+                # P2P connections are unaffected; they just can't be re-made.
+                self._fatal(explain_close(reason, self.room_id))
                 return
             if self._closing:
                 return
@@ -215,105 +243,134 @@ class Link:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 10.0)
 
-    def _set_fatal(self, message: str) -> None:
-        self._fatal = ConnectError(message)
-        self._pulse()
+    def _fatal(self, message: str) -> None:
+        self.events.put_nowait(Fatal(ConnectError(message)))
 
-    async def _send_signal(self, msg: dict[str, Any]) -> None:
+    async def _send_signal(self, to: str, msg: dict[str, Any]) -> None:
         if self._ws is None:
             raise ConnectionError("signaling is down")
-        await self._ws.send(json.dumps(msg))
+        await self._ws.send(json.dumps({**msg, "to": to}))
 
     async def _on_signal(self, msg: dict[str, Any]) -> None:
         t = msg.get("type")
+        sender = msg.get("from")
         if t == "hello":
-            self._peer_id = msg["peer_id"]
-            if msg.get("peers"):
-                self._other_seen = True  # they connected before us
-            log.debug("signaling connected (peer_id=%s)", self._peer_id)
-            # Back on signaling with the P2P link down: try again now
-            if self.is_creator and self._other_seen and not self._connected():
-                self._spawn(self._negotiate())
+            self.peer_id = msg["peer_id"]
+            log.debug("signaling connected (peer_id=%s)", self.peer_id)
+            for other in msg.get("peers", []):
+                self._learn(other)
+            # Back on signaling: retry every pair that's down
+            for pair in list(self._pairs.values()):
+                if not pair.connected:
+                    self._maybe_offer(pair)
         elif t == "peer_joined":
-            self._other_seen = True
-            if self.is_creator and not self._connected():
-                log.info("Peer joined — connecting...")
-                self._spawn(self._negotiate())
-        elif t == "offer" and not self.is_creator:
-            await self._accept_offer(msg)
-        elif t == "answer" and self.is_creator and self._peer is not None:
-            await self._peer.handle_signaling(msg)
-        elif t in ("peer_disconnected", "peer_left"):
-            log.debug("signaling: %s", t)
+            self._learn(msg["peer_id"])
+        elif t == "peer_left":
+            self._lose(msg["peer_id"])
+        elif t == "offer" and isinstance(sender, str):
+            await self._accept_offer(sender, msg)
+        elif t == "answer" and isinstance(sender, str):
+            answered = self._pairs.get(sender)
+            if answered is not None and answered.peer is not None:
+                await answered.peer.handle_signaling(msg)
+        elif t == "peer_disconnected":
+            log.debug("signaling: %s dropped", msg.get("peer_id"))
         elif t == "error":
-            log.error("Signaling server: %s", msg.get("reason"))
+            log.debug("signaling server: %s", msg.get("reason"))
+
+    def _learn(self, peer_id: str) -> None:
+        """A peer is in the room: make sure we're connected to it."""
+        if peer_id == self.peer_id or peer_id in self._forgotten:
+            return
+        pair = self._pairs.setdefault(peer_id, _Pair(peer_id))
+        if not pair.connected:
+            self._maybe_offer(pair)
+
+    def _lose(self, peer_id: str) -> None:
+        pair = self._pairs.pop(peer_id, None)
+        if pair is not None:
+            if pair.retry is not None:
+                pair.retry.cancel()
+            self.events.put_nowait(PeerGone(peer_id))
 
     # ── WebRTC ──────────────────────────────────────────────────────
 
-    def _connected(self) -> bool:
-        return self._ready is not None and not self._ready.closed
+    def _offers_to(self, pair: _Pair) -> bool:
+        """In each pair the smaller peer_id offers (D55)."""
+        return self.peer_id is not None and self.peer_id < pair.peer_id
 
-    def _new_peer(self) -> WebRTCPeer:
-        """Replace the current connection with a fresh one."""
-        old = self._peer
-        if old is not None:
-            self._spawn(old.close())
-        self._ready = None
-        self._last_ice_failed = False
-        self._negotiation_started = time.monotonic()
-        self._peer = WebRTCPeer(on_signaling_message=self._send_signal, config=self._rtc_config)
-        self._pulse()
-        self._spawn(self._watch(self._peer))
-        return self._peer
+    def _maybe_offer(self, pair: _Pair, delay: float = 0.0) -> None:
+        if not self._offers_to(pair) or self._closing:
+            return
+        if pair.retry is not None and not pair.retry.done():
+            return  # one already scheduled
+        pair.retry = asyncio.create_task(self._offer_after(pair, delay))
 
-    async def _negotiate(self) -> None:
-        """Creator: start a new connection with an offer."""
-        if self._closing or self._ws is None:
-            return  # retried on the next hello / peer_joined
-        peer = self._new_peer()
+    async def _offer_after(self, pair: _Pair, delay: float) -> None:
+        if delay:
+            await asyncio.sleep(delay)
+        if self._closing or self._ws is None or pair.connected:
+            return  # signaling down: retried on the next hello
+        if self._pairs.get(pair.peer_id) is not pair:
+            return  # gone meanwhile
+        peer = self._new_peer(pair)
         try:
             await peer.create_offer()
         except ConnectionError:
-            log.debug("couldn't send offer; will retry when signaling is back")
+            log.debug("couldn't send offer to %s; will retry", pair.peer_id)
 
-    async def _renegotiate_soon(self, delay: float = 1.0) -> None:
-        """Creator, after a drop: re-offer unless something else already did."""
-        await asyncio.sleep(delay)
-        if not self._connected() and (self._peer is None or self._peer.closed):
-            await self._negotiate()
-
-    async def _accept_offer(self, msg: dict[str, Any]) -> None:
-        """Joiner: any offer replaces the current connection."""
-        peer = self._new_peer()
+    async def _accept_offer(self, sender: str, msg: dict[str, Any]) -> None:
+        """Any offer from ``sender`` replaces our connection to it."""
+        if sender in self._forgotten:
+            return
+        pair = self._pairs.setdefault(sender, _Pair(sender))
+        peer = self._new_peer(pair)
         try:
             await peer.handle_signaling(msg)
         except ConnectionError:
-            log.debug("couldn't send answer; waiting for a new offer")
+            log.debug("couldn't answer %s; waiting for a new offer", sender)
 
-    async def _watch(self, peer: WebRTCPeer) -> None:
+    def _new_peer(self, pair: _Pair) -> WebRTCPeer:
+        """Replace ``pair``'s connection with a fresh one."""
+        if pair.peer is not None:
+            self._spawn(pair.peer.close())
+        pair.ready = None
+        target = pair.peer_id
+        pair.peer = WebRTCPeer(
+            on_signaling_message=lambda msg: self._send_signal(target, msg),
+            config=self._rtc_config,
+        )
+        self._spawn(self._watch(pair, pair.peer))
+        return pair.peer
+
+    async def _watch(self, pair: _Pair, peer: WebRTCPeer) -> None:
         """Track one connection: publish it when open, notice when it ends."""
         try:
             await asyncio.wait_for(asyncio.shield(peer.channel_ready), CONNECT_TIMEOUT)
         except TimeoutError:
-            if peer is self._peer:
-                self._last_ice_failed = peer.pc.iceConnectionState == "failed"
+            if peer is pair.peer:
+                ice_failed = peer.pc.iceConnectionState == "failed"
                 await peer.close()
-                self._pulse()
-                if self.is_creator and not self._closing:
-                    await asyncio.sleep(2.0)  # then try again
-                    if peer is self._peer:
-                        await self._negotiate()
+                self.events.put_nowait(
+                    PeerUnreachable(
+                        pair.peer_id,
+                        DIRECT_FAILED if ice_failed else "Timed out connecting.",
+                    )
+                )
+                self._maybe_offer(pair, delay=2.0)  # keep trying
             return
-        if peer is not self._peer:
+        if peer is not pair.peer or self._pairs.get(pair.peer_id) is not pair:
             await peer.close()  # superseded while connecting
             return
-        self._ready = peer
-        self._pulse()
+        pair.ready = peer
+        self.events.put_nowait(PeerConnected(pair.peer_id, peer))
 
         await peer.wait_closed()
-        if self._ready is peer:
-            self._ready = None
-            self._pulse()
+        if pair.ready is peer:
+            pair.ready = None
+            # Dropped without a bye (the app forgets peers that say bye):
+            # the offering side tries again shortly
+            self._maybe_offer(pair, delay=1.0)
 
     def _spawn(self, coro: Any) -> None:
         task = asyncio.create_task(coro)

@@ -1,6 +1,7 @@
 import { type FormEvent, useState } from "react";
 
 import { createRoom } from "../lib/connection";
+import { savedName } from "../useRoom";
 import { History } from "./History";
 import { Button, Card } from "./ui";
 
@@ -15,7 +16,17 @@ export function Home({
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string>();
 
+  const [name, setName] = useState(savedName);
   const valid = /^[0-9a-f]{8}$/.test(code);
+
+  const saveName = (value: string) => {
+    setName(value);
+    try {
+      localStorage.setItem("whoosh.name", value.trim().slice(0, 32));
+    } catch {
+      // storage blocked: the name just won't persist
+    }
+  };
 
   // Accept a pasted invite link as well as a bare code
   const onCodeInput = (value: string) => {
@@ -74,6 +85,16 @@ export function Home({
           </form>
         </Card>
       </div>
+      <label className="mt-4 flex items-center gap-3 text-sm text-slate-600 dark:text-slate-400">
+        Your name
+        <input
+          className="w-48 rounded-lg border border-slate-300 bg-white px-3 py-1.5 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-slate-700 dark:bg-slate-900"
+          placeholder="shown to others"
+          value={name}
+          maxLength={32}
+          onChange={(e) => saveName(e.target.value)}
+        />
+      </label>
       <History />
     </>
   );

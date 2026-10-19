@@ -128,8 +128,11 @@ class Ui:
     def hint(self, text: str) -> None:
         self.line(self.style.dim(text))
 
-    def transfer_update(self, t: Transfer) -> None:
+    def transfer_update(self, t: Transfer, peer: str | None = None) -> None:
         arrow = self.style.accent("↑" if t.direction is Direction.SEND else "↓")
+        if peer is not None:
+            # In a room with several people, say who it's to or from
+            arrow += self.style.dim(f" {'to' if t.direction is Direction.SEND else 'from'} {peer}")
         started = self._started.setdefault(t.id, time.monotonic())
         elapsed = max(time.monotonic() - started, 1e-6)
         sent_now = shown_bytes(t) - t.resumed_from  # speed counts this session only
@@ -195,9 +198,16 @@ class Session:
         ui: Ui,
         *,
         on_stall: Callable[[], None] | None = None,
+        name: str | None = None,
+        peer_id: str = "",
     ) -> None:
         self._peer = peer
         self._ui = ui
+        #: Our display name, sent in hello.
+        self._name = name
+        #: How the other peer is shown: its chosen name once its hello
+        #: arrives, a short id until then.
+        self.peer_name = f"peer-{peer_id[:4]}" if peer_id else "peer"
         self.transfers = TransferManager(
             peer, download_dir, on_update=self._on_transfer, on_stall=on_stall
         )
@@ -215,10 +225,10 @@ class Session:
         self.generation = 0
 
     def start(self) -> None:
-        self._send(MessageType.HELLO, HelloPayload(capabilities=CAPABILITIES))
+        self._send(MessageType.HELLO, HelloPayload(capabilities=CAPABILITIES, name=self._name))
 
     def _on_transfer(self, transfer: Transfer) -> None:
-        self._ui.transfer_update(transfer)
+        self._ui.transfer_update(transfer, peer=self.peer_name)
         if transfer.status.finished:  # reported exactly once, when it ends
             history.record(transfer)
 
@@ -278,9 +288,11 @@ class Session:
             return
         if isinstance(payload, HelloPayload):
             if not self.peer_hello.done():
+                if payload.name:
+                    self.peer_name = _clean_name(payload.name)
                 self.peer_hello.set_result(set(payload.capabilities))
         elif isinstance(payload, ChatPayload):
-            self._ui.line(f"{self._ui.style.bold('peer:')} {payload.text}")
+            self._ui.line(f"{self._ui.style.bold(self.peer_name + ':')} {payload.text}")
         elif isinstance(payload, PingPayload):
             self._send(MessageType.PONG, PongPayload(timestamp=payload.timestamp))
         elif isinstance(payload, PongPayload):
@@ -318,3 +330,10 @@ class Session:
     def _send_error(self, code: str, message: str) -> None:
         log.warning("bad input from peer (%s): %s", code, message)
         self._send(MessageType.ERROR, ErrorPayload(code=code, message=message))
+
+
+def _clean_name(name: str) -> str:
+    """A peer's self-chosen name, made safe to print: no control characters
+    (which could rewrite the terminal), at most 32 characters."""
+    printable = "".join(c for c in name if c.isprintable()).strip()
+    return printable[:32] or "peer"

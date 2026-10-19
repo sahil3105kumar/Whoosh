@@ -123,8 +123,6 @@ export class PeerChannel implements Channel {
 
 // ── Connect ─────────────────────────────────────────────────────────
 
-/** How long reconnect() keeps trying after the connection drops. */
-const RECONNECT_TIMEOUT_MS = 60_000;
 /** WebSocket close code the server uses for "room not found / expired / full". */
 const POLICY_VIOLATION = 1008;
 
@@ -134,7 +132,7 @@ export function explainClose(reason: string, roomId: string): string {
     return `Room ${roomId} doesn't exist. Check the code; rooms also expire 10 minutes after they're created.`;
   }
   if (reason.startsWith("Room expired")) return `Room ${roomId} has expired. Ask for a new code.`;
-  if (reason.startsWith("Room is full")) return `Room ${roomId} already has two people in it.`;
+  if (reason.startsWith("Room is full")) return `Room ${roomId} is full.`;
   return reason;
 }
 
@@ -144,44 +142,56 @@ interface Signal {
   reason?: string;
   peer_id?: string;
   peers?: string[];
+  from?: string;
+}
+
+export type MeshEvent =
+  /** An open connection to a peer: new, or replacing one that dropped. */
+  | { type: "connected"; peerId: string; channel: PeerChannel }
+  /** The peer left the room for good (its slot was released). */
+  | { type: "gone"; peerId: string }
+  /** Connecting to the peer timed out; the offering side keeps retrying. */
+  | { type: "unreachable"; peerId: string; message: string }
+  /** The room can't be used any more (gone, full, server unreachable). */
+  | { type: "fatal"; message: string };
+
+/** Our connection to one other peer. */
+interface Pair {
+  peerId: string;
+  pc?: RTCPeerConnection;
+  ready?: PeerChannel;
+  retry?: ReturnType<typeof setTimeout>;
 }
 
 /**
- * A room's connection to the other peer, re-established when it drops
- * (#19, docs/decisions.md D50) — the browser side of apps/cli/connection.py.
+ * Signaling + WebRTC for one room with any number of peers (#23) — the
+ * browser side of apps/cli/connection.py.
  *
- * Owns the signaling WebSocket (reconnecting with its peer_id so it keeps
- * its slot) and the current RTCPeerConnection. When the peer-to-peer
- * connection dies, the room creator re-offers as soon as both sides are
- * reachable through signaling; the joiner accepts any new offer.
+ * Owns the signaling WebSocket and a connection to every other peer (a full
+ * mesh, docs/decisions.md D55). Each pair reconnects on its own when its
+ * connection drops (D50); in every pair the smaller peer_id makes the
+ * offers. A dropped WebSocket reconnects with its peer_id to keep its slot.
  *
  * SDP is sent once ICE gathering completes, with candidates inline — no
  * trickle ICE, because the Python client (aiortc) neither sends nor accepts
  * trickled candidates (D35).
  */
-export class Link {
+export class Mesh {
+  peerId?: string;
   private iceServers: RTCIceServer[] = [];
   private ws?: WebSocket;
-  private peerId?: string;
-  private pc?: RTCPeerConnection;
-  private ready?: PeerChannel;
-  private otherSeen = false;
-  private negotiationStarted?: number;
-  private lastIceFailed = false;
-  private fatal?: ConnectError;
+  private pairs = new Map<string, Pair>();
+  private forgotten = new Set<string>();
   private closing = false;
   private backoffMs = 500;
-  private waiters: (() => void)[] = [];
 
   constructor(
     readonly roomId: string,
-    readonly isCreator: boolean,
-    private readonly onPhase: (phase: ConnectPhase) => void,
+    private readonly onEvent: (event: MeshEvent) => void,
+    private readonly onPhase: (phase: ConnectPhase) => void = () => {},
   ) {}
 
-  /** First connection: waits indefinitely for the other person, then
-   * CONNECT_TIMEOUT_MS for the connection itself. */
-  async open(signal: AbortSignal): Promise<PeerChannel> {
+  async start(signal: AbortSignal): Promise<void> {
     this.iceServers = await fetchIceServers();
     // Bail before opening the socket: a cancelled attempt that reached the
     // server would hold a room slot (React StrictMode runs effects twice).
@@ -189,57 +199,34 @@ export class Link {
     signal.addEventListener("abort", () => this.close());
     this.onPhase("signaling");
     this.connectSignaling();
-    return this.waitReady(true);
   }
 
-  /** After the connection closed: wait for a new one. */
-  reconnect(timeoutMs = RECONNECT_TIMEOUT_MS): Promise<PeerChannel> {
-    if (this.isCreator) setTimeout(() => this.renegotiate(), 1000);
-    return this.waitReady(false, timeoutMs);
+  /** Abandon the connection to `peerId` (it stalled), so a new one is made. */
+  drop(peerId: string): void {
+    const pair = this.pairs.get(peerId);
+    pair?.ready?.close();
+    pair?.pc?.close();
   }
 
-  /** Abandon the current connection (it stalled), so a new one is made. */
-  drop(): void {
-    this.ready?.close();
-    this.pc?.close();
+  /** `peerId` left on purpose: stop trying to reach it. */
+  forget(peerId: string): void {
+    this.forgotten.add(peerId);
+    const pair = this.pairs.get(peerId);
+    this.pairs.delete(peerId);
+    if (pair) {
+      clearTimeout(pair.retry);
+      pair.pc?.close();
+    }
   }
 
   close(): void {
     this.closing = true;
-    this.drop();
-    this.ws?.close();
-    this.pulse();
-  }
-
-  // ── Waiting ───────────────────────────────────────────────────────
-
-  private pulse(): void {
-    const waiters = this.waiters;
-    this.waiters = [];
-    for (const wake of waiters) wake();
-  }
-
-  private async waitReady(first: boolean, timeoutMs?: number): Promise<PeerChannel> {
-    let deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
-    for (;;) {
-      if (this.ready && !this.ready.isClosed) return this.ready;
-      if (this.fatal) throw this.fatal;
-      if (this.closing) throw new ConnectError("Cancelled.");
-      if (first && deadline === undefined && this.negotiationStarted !== undefined) {
-        deadline = this.negotiationStarted + CONNECT_TIMEOUT_MS;
-      }
-      const remaining = deadline === undefined ? undefined : deadline - Date.now();
-      if (remaining !== undefined && remaining <= 0) {
-        if (this.lastIceFailed) throw new ConnectError(directFailedMessage);
-        throw new ConnectError(
-          first ? "Timed out establishing the connection." : "Couldn't reconnect to the other person.",
-        );
-      }
-      await new Promise<void>((resolve) => {
-        this.waiters.push(resolve);
-        if (remaining !== undefined) setTimeout(resolve, remaining);
-      });
+    for (const pair of this.pairs.values()) {
+      clearTimeout(pair.retry);
+      pair.ready?.close();
+      pair.pc?.close();
     }
+    this.ws?.close();
   }
 
   // ── Signaling ─────────────────────────────────────────────────────
@@ -258,21 +245,19 @@ export class Link {
       } catch {
         return;
       }
-      this.onSignal(msg).catch((err: unknown) =>
-        console.error("WebRTC negotiation failed", err),
-      );
+      this.onSignal(msg).catch((err: unknown) => console.error("WebRTC negotiation failed", err));
     });
     ws.addEventListener("close", (event) => {
       if (this.ws === ws) this.ws = undefined;
       if (this.closing) return;
       if (event.code === POLICY_VIOLATION) {
-        // Room gone, expired or full: reconnecting can't help. A live P2P
-        // connection is unaffected; it just can't be re-made.
-        this.setFatal(explainClose(event.reason, this.roomId));
+        // Room gone, expired or full: reconnecting can't help. Live P2P
+        // connections are unaffected; they just can't be re-made.
+        this.onEvent({ type: "fatal", message: explainClose(event.reason, this.roomId) });
         return;
       }
-      if (this.peerId === undefined && !this.ready) {
-        this.setFatal("Can't reach the signaling server.");
+      if (this.peerId === undefined) {
+        this.onEvent({ type: "fatal", message: "Can't reach the signaling server." });
         return;
       }
       setTimeout(() => this.connectSignaling(), this.backoffMs);
@@ -280,123 +265,155 @@ export class Link {
     });
   }
 
-  private setFatal(message: string): void {
-    this.fatal = new ConnectError(message);
-    this.pulse();
-  }
-
-  private sendSignal(msg: object): void {
+  private sendSignal(to: string, msg: object): void {
     if (this.ws?.readyState !== WebSocket.OPEN) throw new Error("signaling is down");
-    this.ws.send(JSON.stringify(msg));
+    this.ws.send(JSON.stringify({ ...msg, to }));
   }
 
   private async onSignal(msg: Signal): Promise<void> {
     switch (msg.type) {
       case "hello":
         this.peerId = msg.peer_id;
-        if (msg.peers?.length) this.otherSeen = true; // they connected before us
         this.backoffMs = 500;
-        if (!this.ready) this.onPhase(this.negotiationStarted ? "connecting" : "waiting");
-        // Back on signaling with the P2P link down: try again now
-        if (this.isCreator && this.otherSeen && !this.connected()) await this.negotiate();
+        if (this.pairs.size === 0 && !msg.peers?.length) this.onPhase("waiting");
+        for (const other of msg.peers ?? []) this.learn(other);
+        // Back on signaling: retry every pair that's down
+        for (const pair of this.pairs.values()) if (!connected(pair)) this.maybeOffer(pair);
         break;
       case "peer_joined":
-        this.otherSeen = true;
-        if (this.isCreator && !this.connected()) await this.negotiate();
+        if (msg.peer_id) this.learn(msg.peer_id);
+        break;
+      case "peer_left":
+        if (msg.peer_id && this.pairs.delete(msg.peer_id)) {
+          this.onEvent({ type: "gone", peerId: msg.peer_id });
+        }
         break;
       case "offer":
-        if (!this.isCreator) await this.acceptOffer(msg.sdp);
+        if (msg.from) await this.acceptOffer(msg.from, msg.sdp);
         break;
-      case "answer":
-        if (this.isCreator && this.pc) await this.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+      case "answer": {
+        const pc = msg.from ? this.pairs.get(msg.from)?.pc : undefined;
+        if (pc) await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
         break;
+      }
       case "error":
-        console.error("signaling server:", msg.reason);
+        console.debug("signaling server:", msg.reason);
         break;
     }
   }
 
-  // ── WebRTC ────────────────────────────────────────────────────────
-
-  private connected(): boolean {
-    return this.ready !== undefined && !this.ready.isClosed;
+  /** A peer is in the room: make sure we're connected to it. */
+  private learn(peerId: string): void {
+    if (peerId === this.peerId || this.forgotten.has(peerId)) return;
+    let pair = this.pairs.get(peerId);
+    if (!pair) {
+      pair = { peerId };
+      this.pairs.set(peerId, pair);
+      this.onPhase("connecting");
+    }
+    if (!connected(pair)) this.maybeOffer(pair);
   }
 
-  /** Replace the current connection with a fresh one. */
-  private newPeer(): RTCPeerConnection {
-    this.pc?.close();
-    this.ready = undefined;
-    this.lastIceFailed = false;
-    this.negotiationStarted = Date.now();
-    this.onPhase("connecting");
+  // ── WebRTC ────────────────────────────────────────────────────────
+
+  /** In each pair the smaller peer_id offers (D55). */
+  private offersTo(pair: Pair): boolean {
+    return this.peerId !== undefined && this.peerId < pair.peerId;
+  }
+
+  private maybeOffer(pair: Pair, delayMs = 0): void {
+    if (!this.offersTo(pair) || this.closing || pair.retry !== undefined) return;
+    pair.retry = setTimeout(() => {
+      pair.retry = undefined;
+      void this.offer(pair);
+    }, delayMs);
+  }
+
+  private async offer(pair: Pair): Promise<void> {
+    if (this.closing || this.ws?.readyState !== WebSocket.OPEN || connected(pair)) return;
+    if (this.pairs.get(pair.peerId) !== pair) return; // gone meanwhile
+    const pc = this.newPeer(pair);
+    this.watch(pair, pc, pc.createDataChannel("whoosh"));
+    await this.sendDescription(pair, pc, await pc.createOffer());
+  }
+
+  /** Any offer from `sender` replaces our connection to it. */
+  private async acceptOffer(sender: string, sdp: string | undefined): Promise<void> {
+    if (this.forgotten.has(sender)) return;
+    let pair = this.pairs.get(sender);
+    if (!pair) {
+      pair = { peerId: sender };
+      this.pairs.set(sender, pair);
+    }
+    const pc = this.newPeer(pair);
+    const target = pair;
+    pc.addEventListener("datachannel", (event) => this.watch(target, pc, event.channel));
+    await pc.setRemoteDescription({ type: "offer", sdp });
+    await this.sendDescription(pair, pc, await pc.createAnswer());
+  }
+
+  private newPeer(pair: Pair): RTCPeerConnection {
+    pair.pc?.close();
+    pair.ready = undefined;
     const pc = new RTCPeerConnection({ iceServers: this.iceServers });
-    this.pc = pc;
-    this.pulse();
+    pair.pc = pc;
     return pc;
   }
 
-  private async negotiate(): Promise<void> {
-    if (this.closing || this.ws?.readyState !== WebSocket.OPEN) return; // retried on next hello
-    const pc = this.newPeer();
-    this.watch(pc, pc.createDataChannel("whoosh"));
-    await this.sendDescription(pc, await pc.createOffer());
-  }
-
-  private renegotiate(): void {
-    if (!this.closing && !this.connected()) void this.negotiate();
-  }
-
-  private async acceptOffer(sdp: string | undefined): Promise<void> {
-    const pc = this.newPeer();
-    pc.addEventListener("datachannel", (event) => this.watch(pc, event.channel));
-    await pc.setRemoteDescription({ type: "offer", sdp });
-    await this.sendDescription(pc, await pc.createAnswer());
-  }
-
   private async sendDescription(
+    pair: Pair,
     pc: RTCPeerConnection,
     description: RTCSessionDescriptionInit,
   ): Promise<void> {
     await pc.setLocalDescription(description);
     await iceGatheringComplete(pc);
-    if (pc !== this.pc) return; // superseded while gathering
+    if (pc !== pair.pc) return; // superseded while gathering
     const local = pc.localDescription!;
     try {
-      this.sendSignal({ type: local.type, sdp: local.sdp });
+      this.sendSignal(pair.peerId, { type: local.type, sdp: local.sdp });
     } catch {
-      // signaling is down; the creator re-offers when it's back
+      // signaling is down; the offering side retries when it's back
     }
   }
 
   /** Track one connection: publish its channel when open, notice when it ends. */
-  private watch(pc: RTCPeerConnection, dc: RTCDataChannel): void {
+  private watch(pair: Pair, pc: RTCPeerConnection, dc: RTCDataChannel): void {
     const timer = setTimeout(() => {
-      if (pc !== this.pc || this.connected()) return;
-      this.lastIceFailed = pc.iceConnectionState === "failed";
+      if (pc !== pair.pc || connected(pair)) return;
+      const iceFailed = pc.iceConnectionState === "failed";
       pc.close();
-      this.pulse();
-      if (this.isCreator && !this.closing) setTimeout(() => this.renegotiate(), 2000);
+      this.onEvent({
+        type: "unreachable",
+        peerId: pair.peerId,
+        message: iceFailed ? directFailedMessage : "Timed out connecting.",
+      });
+      this.maybeOffer(pair, 2000); // keep trying
     }, CONNECT_TIMEOUT_MS);
 
     const open = () => {
       clearTimeout(timer);
-      if (pc !== this.pc) {
+      if (pc !== pair.pc || this.pairs.get(pair.peerId) !== pair) {
         pc.close(); // superseded while connecting
         return;
       }
       const channel = new PeerChannel(dc, pc);
-      this.ready = channel;
-      this.pulse();
+      pair.ready = channel;
+      this.onEvent({ type: "connected", peerId: pair.peerId, channel });
       channel.onClose(() => {
-        if (this.ready === channel) {
-          this.ready = undefined;
-          this.pulse();
-        }
+        if (pair.ready !== channel) return;
+        pair.ready = undefined;
+        // Dropped without a bye (the app forgets peers that say bye): the
+        // offering side tries again shortly
+        this.maybeOffer(pair, 1000);
       });
     };
     if (dc.readyState === "open") open();
     else dc.addEventListener("open", open);
   }
+}
+
+function connected(pair: Pair): boolean {
+  return pair.ready !== undefined && !pair.ready.isClosed;
 }
 
 const directFailedMessage =

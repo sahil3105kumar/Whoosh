@@ -1,32 +1,30 @@
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import type { QueuedFile } from "../lib/queue";
-import type { Transfer } from "../lib/transfer";
-import { type LogEntry, type Phase, useRoom } from "../useRoom";
+import { type LogEntry, type Peer, type PeerTransfer, type Phase, useRoom } from "../useRoom";
 import { Button, Card, formatBytes } from "./ui";
 
 const phaseText: Record<Phase, string> = {
   signaling: "Contacting server…",
-  waiting: "Waiting for the other person to join…",
+  waiting: "Waiting for someone to join…",
   connecting: "Connecting directly…",
   connected: "Connected peer-to-peer",
   reconnecting: "Connection lost — reconnecting…",
-  closed: "The other person left",
+  closed: "Everyone else left",
   error: "Couldn't connect",
 };
 
 export function Room({
   roomId,
-  isCreator,
   onLeave,
   onRetry,
 }: {
   roomId: string;
-  isCreator: boolean;
   onLeave: () => void;
   onRetry: () => void;
 }) {
-  const room = useRoom(roomId, isCreator);
+  const room = useRoom(roomId);
+  const [inviting, setInviting] = useState(false);
   const live = room.phase === "connected";
   const canSend = live && room.peerReady;
   const dragging = usePageDrop(canSend, room.sendFiles);
@@ -66,10 +64,16 @@ export function Room({
             Ping
           </Button>
         )}
+        {live && (
+          <Button variant="ghost" onClick={() => setInviting((v) => !v)}>
+            Invite
+          </Button>
+        )}
         {room.phase === "error" && <Button onClick={onRetry}>Try again</Button>}
         <Button variant="secondary" onClick={leave}>
           Leave
         </Button>
+        {room.peers.length > 0 && <PeerList peers={room.peers} />}
         {room.error && (
           <p className="w-full text-sm text-red-600 dark:text-red-400" role="alert">
             {room.error}
@@ -77,7 +81,7 @@ export function Room({
         )}
       </Card>
 
-      {room.phase === "waiting" && isCreator && <ShareBox roomId={roomId} />}
+      {(room.phase === "waiting" || inviting) && <ShareBox roomId={roomId} />}
 
       {(live || room.log.length > 0 || room.transfers.length > 0) && (
         <div className="grid gap-4 md:grid-cols-2">
@@ -176,6 +180,27 @@ function useWarnBeforeUnload(active: boolean): void {
   }, [active]);
 }
 
+/** Who's in the room (#26). */
+function PeerList({ peers }: { peers: Peer[] }) {
+  return (
+    <ul className="flex w-full flex-wrap gap-2" aria-label="People in the room">
+      {peers.map((p) => (
+        <li
+          key={p.id}
+          className="flex items-center gap-1.5 rounded-full bg-slate-100 px-2.5 py-0.5 text-xs dark:bg-slate-800"
+          title={p.connected ? "Connected" : "Reconnecting"}
+        >
+          <span
+            className={`size-1.5 rounded-full ${p.connected ? "bg-emerald-500" : "animate-pulse bg-amber-400"}`}
+            aria-hidden
+          />
+          {p.name}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function StatusDot({ phase }: { phase: Phase }) {
   const color =
     phase === "connected"
@@ -263,7 +288,12 @@ function Chat({
               {entry.text}
             </p>
           ) : (
-            <div key={entry.id} className={`flex ${entry.from === "me" ? "justify-end" : ""}`}>
+            <div key={entry.id} className={`flex flex-col ${entry.from === "me" ? "items-end" : "items-start"}`}>
+              {entry.name && (
+                <span className="mb-0.5 px-1 text-xs text-slate-500 dark:text-slate-400">
+                  {entry.name}
+                </span>
+              )}
               <p
                 className={`max-w-[85%] rounded-2xl px-3 py-1.5 text-sm break-words whitespace-pre-wrap ${
                   entry.from === "me"
@@ -303,7 +333,7 @@ function Files({
   onCancel,
   onUnqueue,
 }: {
-  transfers: Transfer[];
+  transfers: PeerTransfer[];
   queued: readonly QueuedFile[];
   canSend: boolean;
   onSend: (files: File[]) => void;
@@ -359,7 +389,7 @@ function Files({
           </li>
         ))}
         {[...transfers].reverse().map((t) => (
-          <TransferRow key={t.id} transfer={t} onCancel={() => onCancel(t.id)} />
+          <TransferRow key={t.key} transfer={t} onCancel={() => onCancel(t.key)} />
         ))}
         {queued.length === 0 && transfers.length === 0 && (
           <li className="text-sm text-slate-500 dark:text-slate-400">No files yet.</li>
@@ -369,7 +399,7 @@ function Files({
   );
 }
 
-function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: () => void }) {
+function TransferRow({ transfer: t, onCancel }: { transfer: PeerTransfer; onCancel: () => void }) {
   // A sender with acks shows what the receiver has stored, not just what left
   const done = t.direction === "send" && t.acked ? t.bytesAcked : t.bytesDone;
   const pct = t.size ? (100 * done) / t.size : 100;
@@ -390,6 +420,10 @@ function TransferRow({ transfer: t, onCancel }: { transfer: Transfer; onCancel: 
         <span aria-label={t.direction === "send" ? "Sending" : "Receiving"}>{arrow}</span>
         <span className="min-w-0 flex-1 truncate font-medium" title={t.filename}>
           {t.filename}
+          <span className="font-normal text-slate-500 dark:text-slate-400">
+            {" "}
+            {t.direction === "send" ? "to" : "from"} {t.peerName}
+          </span>
         </span>
         <span className="shrink-0 text-xs text-slate-500 dark:text-slate-400">
           {formatBytes(t.size)}
